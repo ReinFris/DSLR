@@ -1,5 +1,5 @@
 /*
- * AS5600 Magnetic Encoder + AccelStepper Motor Control
+ * AS5600 Encoder + AccelStepper Motor + Joystick Control
  *
  * WIRING INSTRUCTIONS - AS5600 to Arduino Uno:
  * ============================================
@@ -18,6 +18,21 @@
  * Driver EN    -> Arduino Pin 6 (Enable - active LOW)
  * Driver VCC   -> External power supply (check driver voltage rating)
  * Driver GND   -> Common ground with Arduino
+ *
+ * WIRING INSTRUCTIONS - Analog Joystick to Arduino Uno:
+ * ======================================================
+ * Joystick VCC -> Arduino 5V
+ * Joystick GND -> Arduino GND
+ * Joystick VRX -> Arduino A0 (X-axis analog input, 0-1023)
+ * Joystick VRY -> Not connected (not used yet)
+ * Joystick SW  -> Arduino Pin 2 (switch/button, active LOW)
+ *
+ * JOYSTICK CONTROL:
+ * ================
+ * - Center position (VRX ~512): Motor stopped
+ * - Push right (VRX > 512): Motor moves forward, speed increases with deflection
+ * - Push left (VRX < 512): Motor moves backward, speed increases with deflection
+ * - Press button (SW): Emergency stop / reset position to zero
  *
  * MAGNET PLACEMENT:
  * ================
@@ -42,9 +57,13 @@
 #define ENABLE_PIN 6 // Enable pin (active LOW)
 #define LED_PIN 13   // Built-in LED for debugging
 
+// Joystick pins
+#define JOYSTICK_VRX A0 // X-axis analog input
+#define JOYSTICK_SW 2   // Switch button (active LOW)
+
 // Motor configuration
 #define STEPS_PER_REV 200                        // Steps per revolution (1.8° motor = 200 steps)
-#define MICROSTEPS 2 * 4                         // Microstepping setting on driver
+#define MICROSTEPS 4                             // Microstepping setting on driver
 #define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS) // Total steps per revolution
 
 // Create EncoderReader object
@@ -55,9 +74,17 @@ EncoderReader encoder;
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 // Motor control parameters
-#define MAX_SPEED 9000.0     // Maximum speed in steps/second
-#define ACCELERATION 10000.0 // Acceleration in steps/second^2
-#define DEFAULT_SPEED 1000.0 // Default speed for moves
+#define MAX_SPEED 3000.0 // Maximum speed in steps/second
+#define ACCELERATION 1.0 // Acceleration in steps/second^2
+
+// Joystick parameters
+#define JOYSTICK_CENTER 512  // Center position (ADC value 0-1023)
+#define JOYSTICK_DEADZONE 50 // Deadzone around center (prevents drift)
+#define JOYSTICK_MIN 0       // Minimum ADC value
+#define JOYSTICK_MAX 800     // Maximum ADC value
+
+// Debug settings
+#define ENABLE_SERIAL_PRINT false // Set to false to disable loop serial output for better performance
 
 void setup()
 {
@@ -71,6 +98,10 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
+  // Initialize joystick pins
+  pinMode(JOYSTICK_VRX, INPUT);
+  pinMode(JOYSTICK_SW, INPUT_PULLUP); // Use internal pull-up for button
+
   // Initialize motor pins
   pinMode(ENABLE_PIN, OUTPUT);
   digitalWrite(ENABLE_PIN, LOW); // Enable the motor driver (active LOW)
@@ -80,7 +111,7 @@ void setup()
   stepper.setAcceleration(ACCELERATION);
   stepper.setCurrentPosition(0); // Set current position as zero
 
-  Serial.println("=== AccelStepper Motor Control ===");
+  Serial.println("=== AccelStepper Motor + Joystick Control ===");
   Serial.print("Max Speed: ");
   Serial.print(MAX_SPEED);
   Serial.println(" steps/sec");
@@ -89,6 +120,12 @@ void setup()
   Serial.println(" steps/sec^2");
   Serial.print("Steps per revolution: ");
   Serial.println(TOTAL_STEPS);
+  Serial.println();
+  Serial.println("Joystick Controls:");
+  Serial.println("  - Center: Stop");
+  Serial.println("  - Right: Forward (speed increases with deflection)");
+  Serial.println("  - Left: Backward (speed increases with deflection)");
+  Serial.println("  - Button: Reset motor position to zero");
   Serial.println();
 
   // Initialize I2C (Wire library)
@@ -276,15 +313,85 @@ void loop()
 {
   // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
   // This handles acceleration, deceleration, and stepping
-  stepper.run();
+  // stepper.run();
 
   // Update encoder state (detects rotation crossings)
   encoder.update();
 
+  // Read joystick VRX (X-axis)
+  int vrxValue = analogRead(JOYSTICK_VRX);
+
+  // Read joystick button (active LOW)
+  bool buttonPressed = (digitalRead(JOYSTICK_SW) == LOW);
+
+  // Handle button press - reset motor position to zero
+  static bool lastButtonState = false;
+  if (buttonPressed && !lastButtonState)
+  {
+    stepper.setCurrentPosition(0);
+    Serial.println(">>> Button pressed! Motor position reset to 0");
+  }
+  lastButtonState = buttonPressed;
+
+  // Calculate motor speed based on joystick position
+  float targetSpeed = 0.0;
+
+  if (abs(vrxValue - JOYSTICK_CENTER) > JOYSTICK_DEADZONE)
+  {
+    // Joystick is outside deadzone - calculate speed
+    if (vrxValue > JOYSTICK_CENTER + JOYSTICK_DEADZONE)
+    {
+      // Right - Forward motion
+      float normalizedInput = (float)(vrxValue - JOYSTICK_CENTER - JOYSTICK_DEADZONE) /
+                              (float)(JOYSTICK_MAX - JOYSTICK_CENTER - JOYSTICK_DEADZONE);
+      targetSpeed = normalizedInput * MAX_SPEED;
+    }
+    else if (vrxValue < JOYSTICK_CENTER - JOYSTICK_DEADZONE)
+    {
+      // Left - Backward motion
+      float normalizedInput = (float)(JOYSTICK_CENTER - JOYSTICK_DEADZONE - vrxValue) /
+                              (float)(JOYSTICK_CENTER - JOYSTICK_DEADZONE - JOYSTICK_MIN);
+      targetSpeed = -normalizedInput * MAX_SPEED;
+    }
+  }
+
+  // Set motor speed using runSpeed mode
+  stepper.setSpeed(targetSpeed);
+  stepper.run();
+
   // Print encoder and motor data every 100ms (non-blocking)
   static unsigned long lastPrint = 0;
-  uint16_t rawAngle = encoder.getRawAngle();
+  if (ENABLE_SERIAL_PRINT && (millis() - lastPrint >= 100))
+  {
+    lastPrint = millis();
 
+    // Get encoder readings
+    uint16_t rawAngle = encoder.getRawAngle();
+    float degrees = encoder.getDegrees();
+    long rotationCount = encoder.getRotationCount();
+
+    // Get motor status
+    long motorPosition = stepper.currentPosition();
+
+    // Print formatted output
+    Serial.print("VRX: ");
+    Serial.print(vrxValue);
+    Serial.print(" | Speed: ");
+    Serial.print(targetSpeed, 0);
+    Serial.print(" | Pos: ");
+    Serial.print(motorPosition);
+    Serial.print(" | Enc: ");
+    Serial.print(rawAngle);
+    Serial.print(" (");
+    Serial.print(degrees, 1);
+    Serial.print("°) | Rot: ");
+    Serial.print(rotationCount);
+    Serial.print(" | Btn: ");
+    Serial.println(buttonPressed ? "PRESSED" : "---");
+  }
+
+  // Blink LED based on encoder position (always active)
+  uint16_t rawAngle = encoder.getRawAngle();
   if (rawAngle < 100) // Near zero position
   {
     digitalWrite(LED_PIN, HIGH);
@@ -292,22 +399,5 @@ void loop()
   else
   {
     digitalWrite(LED_PIN, LOW);
-  }
-  // Trigger a move when motor is idle (every 3 seconds)
-  // Alternates between forward and backward rotation
-  static unsigned long lastMove = 0;
-  static bool forward = true;
-  if (stepper.distanceToGo() == 0 && millis() - lastMove >= 3000)
-  {
-    lastMove = millis();
-    if (forward)
-    {
-      rotateDegrees(720.0); // Rotate forward
-    }
-    else
-    {
-      rotateDegrees(-720.0); // Rotate backward
-    }
-    forward = !forward; // Toggle direction for next move
   }
 }
