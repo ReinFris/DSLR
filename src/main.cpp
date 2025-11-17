@@ -1,5 +1,5 @@
 /*
- * AS5600 Magnetic Encoder Test
+ * AS5600 Magnetic Encoder + AccelStepper Motor Control
  *
  * WIRING INSTRUCTIONS - AS5600 to Arduino Uno:
  * ============================================
@@ -10,6 +10,14 @@
  * AS5600 DIR   -> Arduino GND (sets rotation direction - can also connect to 5V)
  * AS5600 GPO   -> Not connected (optional output pin)
  * AS5600 PGO   -> Not connected (programming pin)
+ *
+ * WIRING INSTRUCTIONS - Stepper Driver to Arduino Uno:
+ * ====================================================
+ * Driver STEP  -> Arduino Pin 5
+ * Driver DIR   -> Arduino Pin 4
+ * Driver EN    -> Arduino Pin 6 (Enable - active LOW)
+ * Driver VCC   -> External power supply (check driver voltage rating)
+ * Driver GND   -> Common ground with Arduino
  *
  * MAGNET PLACEMENT:
  * ================
@@ -25,77 +33,36 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <AccelStepper.h>
 #include "EncoderReader.h"
 
-// Motor pins (commented out for encoder testing)
-// #define enablePin 6              // Enable
-// #define dirPin 4                 // Direction
-// #define stepPin 5                // Steps
-#define LED_PIN 13 // Built-in LED for debugging
-// #define stepsPerRevolution 15000 // Full revolution with microstepping
+// Motor pins
+#define STEP_PIN 5   // Step pin
+#define DIR_PIN 4    // Direction pin
+#define ENABLE_PIN 6 // Enable pin (active LOW)
+#define LED_PIN 13   // Built-in LED for debugging
+
+// Motor configuration
+#define STEPS_PER_REV 200                        // Steps per revolution (1.8° motor = 200 steps)
+#define MICROSTEPS 2 * 4                         // Microstepping setting on driver
+#define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS) // Total steps per revolution
 
 // Create EncoderReader object
 EncoderReader encoder;
 
-// Smooth motion parameters (commented out for encoder testing)
-// #define MAX_SPEED 50    // Minimum delay in microseconds (faster)
-// #define MIN_SPEED 2500  // Maximum delay in microseconds (slower)
-// #define ACCEL_STEPS 800 // Steps to accelerate/decelerate
-// int currentDelay = MIN_SPEED;
+// Create AccelStepper object using DRIVER mode (step/direction interface)
+// AccelStepper stepper(interface, stepPin, directionPin)
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
-// ============================================================
-// SMOOTHSTEP FUNCTIONS (commented out for encoder testing)
-// ============================================================
-/*
-// Original smoothstep (3rd order polynomial)
-// Zero 1st derivative at edges
-float smoothstep(float t)
-{
-  if (t <= 0.0f)
-    return 0.0f;
-  if (t >= 1.0f)
-    return 1.0f;
-  return t * t * (3.0f - 2.0f * t); // 3t² - 2t³
-}
-
-// Ken Perlin's smootherstep (5th order polynomial)
-// Zero 1st and 2nd derivatives at edges - RECOMMENDED for motor control
-float smootherstep(float t)
-{
-  if (t <= 0.0f)
-    return 0.0f;
-  if (t >= 1.0f)
-    return 1.0f;
-  return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); // 6t⁵ - 15t⁴ + 10t³
-}
-
-// 7th order smoothstep - Ultra smooth but computationally expensive
-// Zero 1st, 2nd, and 3rd derivatives at edges
-float smootheststep(float t)
-{
-  if (t <= 0.0f)
-    return 0.0f;
-  if (t >= 1.0f)
-    return 1.0f;
-  return t * t * t * t * (35.0f - t * (84.0f - t * (70.0f - 20.0f * t))); // -20t⁷ + 70t⁶ - 84t⁵ + 35t⁴
-}
-
-// Map a value using smootherstep interpolation (better than linear map)
-float smoothMap(float x, float in_min, float in_max, float out_min, float out_max)
-{
-  // Normalize input to 0-1 range
-  float t = (x - in_min) / (in_max - in_min);
-  // Apply smootherstep
-  float smooth_t = smootherstep(t);
-  // Map to output range
-  return out_min + smooth_t * (out_max - out_min);
-}
-*/
+// Motor control parameters
+#define MAX_SPEED 9000.0     // Maximum speed in steps/second
+#define ACCELERATION 10000.0 // Acceleration in steps/second^2
+#define DEFAULT_SPEED 1000.0 // Default speed for moves
 
 void setup()
 {
   // Initialize serial for debugging
-  Serial.begin(9600);
+  Serial.begin(115200);
   delay(1000);
   Serial.println("=== AS5600 Magnetic Encoder Test ===");
   Serial.println();
@@ -103,6 +70,26 @@ void setup()
   // Initialize LED
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+
+  // Initialize motor pins
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(ENABLE_PIN, LOW); // Enable the motor driver (active LOW)
+
+  // Initialize AccelStepper
+  stepper.setMaxSpeed(MAX_SPEED);
+  stepper.setAcceleration(ACCELERATION);
+  stepper.setCurrentPosition(0); // Set current position as zero
+
+  Serial.println("=== AccelStepper Motor Control ===");
+  Serial.print("Max Speed: ");
+  Serial.print(MAX_SPEED);
+  Serial.println(" steps/sec");
+  Serial.print("Acceleration: ");
+  Serial.print(ACCELERATION);
+  Serial.println(" steps/sec^2");
+  Serial.print("Steps per revolution: ");
+  Serial.println(TOTAL_STEPS);
+  Serial.println();
 
   // Initialize I2C (Wire library)
   Wire.begin();
@@ -204,46 +191,7 @@ void setup()
   }
 
   Serial.println();
-
-  // Diagnostic: Rotate magnet slowly and observe the raw angle range
-  Serial.println("=== Diagnostic: Checking raw angle range ===");
-  Serial.println("Please rotate the magnet SLOWLY through one full rotation...");
-  delay(2000);
-
-  uint16_t minRaw = 4095;
-  uint16_t maxRaw = 0;
-
-  // Sample for 10 seconds while user rotates
-  for (int i = 0; i < 100; i++)
-  {
-    encoder.update();
-    uint16_t raw = encoder.getRawAngle();
-    if (raw < minRaw) minRaw = raw;
-    if (raw > maxRaw) maxRaw = raw;
-
-    Serial.print("Raw: ");
-    Serial.print(raw);
-    Serial.print(" | Min: ");
-    Serial.print(minRaw);
-    Serial.print(" | Max: ");
-    Serial.println(maxRaw);
-    delay(100);
-  }
-
-  Serial.println();
-  Serial.println("=== Range Test Complete ===");
-  Serial.print("Min raw angle seen: ");
-  Serial.println(minRaw);
-  Serial.print("Max raw angle seen: ");
-  Serial.println(maxRaw);
-  Serial.print("Total range: ");
-  Serial.print(maxRaw - minRaw);
-  Serial.println(" (should be ~4095 for full rotation)");
-  Serial.println();
-
-  Serial.println("=== Now starting normal operation ===");
-  Serial.println("Format: Raw Angle | Degrees | Direction");
-  Serial.println("=========================================");
+  Serial.println("=== Ready for operation ===");
   Serial.println();
 
   // Optional: Set current position as home point
@@ -260,86 +208,83 @@ void setup()
 }
 
 // ============================================================
-// MOTOR CONTROL FUNCTION (commented out for encoder testing)
+// MOTOR CONTROL FUNCTIONS
 // ============================================================
-/*
-void smoothStep(int totalSteps, bool forward)
+
+// Move motor to absolute position (in steps)
+void moveToPosition(long position)
 {
-  digitalWrite(dirPin, forward ? HIGH : LOW);
-  delay(5); // Direction setup time
-
-  for (int i = 0; i < totalSteps; i++)
-  {
-    float t;           // Normalized position (0.0 to 1.0)
-    float speedFactor; // 0.0 (stopped) to 1.0 (full speed)
-
-    // Calculate speed with acceleration/deceleration using smootherstep
-    if (i < ACCEL_STEPS)
-    {
-      // Accelerate: 0.0 to 1.0 speed
-      t = (float)i / (float)ACCEL_STEPS;
-      speedFactor = smootherstep(t);
-    }
-    else if (i >= (totalSteps - ACCEL_STEPS))
-    {
-      // Decelerate: 1.0 to 0.0 speed
-      t = (float)(i - (totalSteps - ACCEL_STEPS)) / (float)ACCEL_STEPS;
-      speedFactor = 1.0f - smootherstep(t);
-    }
-    else
-    {
-      // Constant max speed
-      speedFactor = 1.0f;
-    }
-
-    // Convert speed factor to delay (inverse relationship)
-    // Use reciprocal interpolation for proper speed curve
-    float minFreq = 1.0f / (float)MIN_SPEED;
-    float maxFreq = 1.0f / (float)MAX_SPEED;
-    float currentFreq = minFreq + speedFactor * (maxFreq - minFreq);
-    currentDelay = (int)(1.0f / currentFreq);
-
-    // Generate step pulse
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(currentDelay);
-    digitalWrite(stepPin, LOW);
-    delayMicroseconds(currentDelay);
-  }
+  stepper.moveTo(position);
+  Serial.print("Moving to position: ");
+  Serial.println(position);
 }
-*/
+
+// Move motor by relative steps (positive = forward, negative = backward)
+void moveRelative(long steps)
+{
+  stepper.move(steps);
+  Serial.print("Moving by ");
+  Serial.print(steps);
+  Serial.println(" steps");
+}
+
+// Rotate motor by degrees (based on TOTAL_STEPS configuration)
+void rotateDegrees(float degrees)
+{
+  long steps = (long)((degrees / 360.0) * TOTAL_STEPS);
+  stepper.move(steps);
+  Serial.print("Rotating ");
+  Serial.print(degrees);
+  Serial.print("° (");
+  Serial.print(steps);
+  Serial.println(" steps)");
+}
+
+// Rotate one full revolution forward
+void rotateOneRevolution()
+{
+  rotateDegrees(360.0);
+}
+
+// Example: Run a simple test sequence
+void runTestSequence()
+{
+  Serial.println("\n=== Starting Test Sequence ===");
+
+  // Move forward one revolution
+  Serial.println("Test 1: Rotating 360° forward");
+  rotateDegrees(360.0);
+  while (stepper.distanceToGo() != 0)
+  {
+    stepper.run();
+  }
+  delay(1000);
+
+  // Move backward one revolution
+  Serial.println("Test 2: Rotating 360° backward");
+  rotateDegrees(-360.0);
+  while (stepper.distanceToGo() != 0)
+  {
+    stepper.run();
+  }
+  delay(1000);
+
+  Serial.println("=== Test Sequence Complete ===\n");
+}
 
 void loop()
 {
+  // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
+  // This handles acceleration, deceleration, and stepping
+  stepper.run();
+
   // Update encoder state (detects rotation crossings)
   encoder.update();
 
-  // Get encoder readings using class methods
+  // Print encoder and motor data every 100ms (non-blocking)
+  static unsigned long lastPrint = 0;
   uint16_t rawAngle = encoder.getRawAngle();
-  float degrees = encoder.getDegrees();
-  long rotationCount = encoder.getRotationCount();
 
-  // Print formatted output
-  Serial.print("Raw: ");
-  Serial.print(rawAngle);
-  Serial.print("\t| Deg: ");
-  Serial.print(degrees, 2);
-  Serial.print("°\t| Rotations: ");
-  Serial.print(rotationCount);
-
-  // Visual indicator - print a simple bar graph
-  Serial.print("\t| ");
-  int barLength = (int)((degrees / 360.0) * 40);
-  for (int i = 0; i < 40; i++)
-  {
-    if (i < barLength)
-      Serial.print("█");
-    else
-      Serial.print("·");
-  }
-
-  Serial.println();
-
-  // Blink LED based on position
   if (rawAngle < 100) // Near zero position
   {
     digitalWrite(LED_PIN, HIGH);
@@ -348,6 +293,21 @@ void loop()
   {
     digitalWrite(LED_PIN, LOW);
   }
-
-  delay(1); // Update rate: 100Hz (faster sampling for rotation detection)
+  // Trigger a move when motor is idle (every 3 seconds)
+  // Alternates between forward and backward rotation
+  static unsigned long lastMove = 0;
+  static bool forward = true;
+  if (stepper.distanceToGo() == 0 && millis() - lastMove >= 3000)
+  {
+    lastMove = millis();
+    if (forward)
+    {
+      rotateDegrees(720.0); // Rotate forward
+    }
+    else
+    {
+      rotateDegrees(-720.0); // Rotate backward
+    }
+    forward = !forward; // Toggle direction for next move
+  }
 }
