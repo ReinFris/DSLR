@@ -24,18 +24,18 @@
  */
 
 #include <Arduino.h>
-#include <AS5600.h>
 #include <Wire.h>
+#include "EncoderReader.h"
 
 // Motor pins (commented out for encoder testing)
 // #define enablePin 6              // Enable
 // #define dirPin 4                 // Direction
 // #define stepPin 5                // Steps
-#define LED_PIN 13               // Built-in LED for debugging
+#define LED_PIN 13 // Built-in LED for debugging
 // #define stepsPerRevolution 15000 // Full revolution with microstepping
 
-// Create AS5600 encoder object
-AS5600 encoder;
+// Create EncoderReader object
+EncoderReader encoder;
 
 // Smooth motion parameters (commented out for encoder testing)
 // #define MAX_SPEED 50    // Minimum delay in microseconds (faster)
@@ -108,12 +108,53 @@ void setup()
   Wire.begin();
 
   // Initialize AS5600 encoder
-  encoder.begin(4);  // 4 = default I2C direction mode
+  encoder.begin(4); // 4 = default I2C direction mode
 
   // Check if AS5600 is connected
   if (encoder.isConnected())
   {
     Serial.println("✓ AS5600 detected!");
+
+    // Check AS5600 configuration registers for angle limiting
+    Serial.println("\n--- AS5600 Configuration ---");
+
+    // Read ZPOS (Zero Position) register 0x01-0x02
+    Wire.beginTransmission(0x36);
+    Wire.write(0x01);
+    Wire.endTransmission();
+    Wire.requestFrom(0x36, 2);
+    uint16_t zpos = (Wire.read() << 8) | Wire.read();
+
+    // Read MPOS (Maximum Position) register 0x03-0x04
+    Wire.beginTransmission(0x36);
+    Wire.write(0x03);
+    Wire.endTransmission();
+    Wire.requestFrom(0x36, 2);
+    uint16_t mpos = (Wire.read() << 8) | Wire.read();
+
+    // Read MANG (Maximum Angle) register 0x05-0x06
+    Wire.beginTransmission(0x36);
+    Wire.write(0x05);
+    Wire.endTransmission();
+    Wire.requestFrom(0x36, 2);
+    uint16_t mang = (Wire.read() << 8) | Wire.read();
+
+    Serial.print("ZPOS (Zero Position): ");
+    Serial.println(zpos);
+    Serial.print("MPOS (Max Position): ");
+    Serial.println(mpos);
+    Serial.print("MANG (Max Angle): ");
+    Serial.print(mang);
+    Serial.print(" (");
+    Serial.print((mang * 360.0) / 4096.0, 1);
+    Serial.println("°)");
+
+    if (mang > 0 && mang < 4095)
+    {
+      Serial.println("⚠ WARNING: MANG is set to limit output range!");
+      Serial.println("  This will restrict angle to less than 360°");
+    }
+    Serial.println("----------------------------\n");
 
     // Flash LED 3 times to indicate successful connection
     for (int i = 0; i < 3; i++)
@@ -163,10 +204,57 @@ void setup()
   }
 
   Serial.println();
-  Serial.println("=== Now rotate the magnet by hand ===");
+
+  // Diagnostic: Rotate magnet slowly and observe the raw angle range
+  Serial.println("=== Diagnostic: Checking raw angle range ===");
+  Serial.println("Please rotate the magnet SLOWLY through one full rotation...");
+  delay(2000);
+
+  uint16_t minRaw = 4095;
+  uint16_t maxRaw = 0;
+
+  // Sample for 10 seconds while user rotates
+  for (int i = 0; i < 100; i++)
+  {
+    encoder.update();
+    uint16_t raw = encoder.getRawAngle();
+    if (raw < minRaw) minRaw = raw;
+    if (raw > maxRaw) maxRaw = raw;
+
+    Serial.print("Raw: ");
+    Serial.print(raw);
+    Serial.print(" | Min: ");
+    Serial.print(minRaw);
+    Serial.print(" | Max: ");
+    Serial.println(maxRaw);
+    delay(100);
+  }
+
+  Serial.println();
+  Serial.println("=== Range Test Complete ===");
+  Serial.print("Min raw angle seen: ");
+  Serial.println(minRaw);
+  Serial.print("Max raw angle seen: ");
+  Serial.println(maxRaw);
+  Serial.print("Total range: ");
+  Serial.print(maxRaw - minRaw);
+  Serial.println(" (should be ~4095 for full rotation)");
+  Serial.println();
+
+  Serial.println("=== Now starting normal operation ===");
   Serial.println("Format: Raw Angle | Degrees | Direction");
   Serial.println("=========================================");
   Serial.println();
+
+  // Optional: Set current position as home point
+  // Uncomment the line below to set the current position as zero
+  // encoder.setHome();
+
+  // Or set a specific offset in degrees (e.g., 90 degrees)
+  // encoder.setDegreeOffset(90.0);
+
+  // Or set a specific offset in raw angle units (e.g., 1024 = 90 degrees)
+  // encoder.setAngleOffset(1024);
 
   delay(1000);
 }
@@ -222,27 +310,13 @@ void smoothStep(int totalSteps, bool forward)
 
 void loop()
 {
-  // Read raw angle from encoder (0-4095, 12-bit resolution)
-  uint16_t rawAngle = encoder.rawAngle();
+  // Update encoder state (detects rotation crossings)
+  encoder.update();
 
-  // Convert to degrees (0-360)
-  float degrees = (rawAngle * 360.0) / 4096.0;
-
-  // Determine rotation direction (clockwise or counter-clockwise)
-  static uint16_t lastAngle = 0;
-  static long rotationCount = 0;
-
-  // Detect zero crossing
-  if (lastAngle > 3800 && rawAngle < 300)  // Crossed 0 going forward
-  {
-    rotationCount++;
-  }
-  else if (lastAngle < 300 && rawAngle > 3800)  // Crossed 0 going backward
-  {
-    rotationCount--;
-  }
-
-  lastAngle = rawAngle;
+  // Get encoder readings using class methods
+  uint16_t rawAngle = encoder.getRawAngle();
+  float degrees = encoder.getDegrees();
+  long rotationCount = encoder.getRotationCount();
 
   // Print formatted output
   Serial.print("Raw: ");
@@ -266,7 +340,7 @@ void loop()
   Serial.println();
 
   // Blink LED based on position
-  if (rawAngle < 100)  // Near zero position
+  if (rawAngle < 100) // Near zero position
   {
     digitalWrite(LED_PIN, HIGH);
   }
@@ -275,5 +349,5 @@ void loop()
     digitalWrite(LED_PIN, LOW);
   }
 
-  delay(100);  // Update rate: 10Hz
+  delay(1); // Update rate: 100Hz (faster sampling for rotation detection)
 }
