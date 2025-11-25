@@ -20,14 +20,19 @@
 #define STEP_PIN 5
 #define DIR_PIN 4
 #define ENABLE_PIN 6
-#define SW_RX 7 // SoftwareSerial RX (connect to TMC2209 PDN_UART via 1k resistor to SW_TX)
-#define SW_TX 8 // SoftwareSerial TX (connect to TMC2209 PDN_UART)
+#define SW_RX 7      // SoftwareSerial RX (connect to TMC2209 PDN_UART via 1k resistor to SW_TX)
+#define SW_TX 8      // SoftwareSerial TX (connect to TMC2209 PDN_UART)
+#define STALLGUARD 3 // DIAG pin from TMC2209
 
 // TMC2209 Configuration
 #define R_SENSE 0.11f       // SilentStepStick series use 0.11 Ohm
 #define DRIVER_ADDRESS 0b00 // TMC2209 Driver address according to MS1 and MS2
-#define RUN_CURRENT 600     // Motor current in mA (adjust based on your motor specs)
-#define MICROSTEPS 16       // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
+#define RUN_CURRENT 1770    // Motor current in mA (adjust based on your motor specs)
+#define MICROSTEPS 256      // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
+
+// StallGuard Configuration
+#define STALL_VALUE 128 // [0..255] - Higher = less sensitive, Lower = more sensitive
+#define TOFF_VALUE 5    // [1..15] Off time setting
 
 // Other I/O Pins
 #define LED_PIN 13
@@ -44,61 +49,157 @@ TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
 
 //== Setup ======================================================================================
 
-void setup() {
+void setup()
+{
 
-  Serial.begin(115200);               // initialize hardware serial for debugging
-  SoftSerial.begin(115200);           // initialize software serial for UART motor control
+  Serial.begin(115200); // initialize hardware serial for debugging
+  while (!Serial)
+    ;                       // Wait for serial port to connect
+  SoftSerial.begin(115200); // initialize software serial for UART motor control
 
+  // IMPORTANT: Enable driver in hardware BEFORE UART communication
   pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, LOW);      // Enable driver in hardware (active LOW)
+  digitalWrite(ENABLE_PIN, LOW); // Enable driver in hardware (active LOW)
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
+  pinMode(STALLGUARD, INPUT); // DIAG pin for real-time stall detection
 
-  Serial.println("TMC2209 Test Script");
+  Serial.println("TMC2209 StallGuard Test with Joystick Control");
   Serial.println("Wiring: EN=6, DIR=4, STEP=5, SW_RX=7, SW_TX=8");
   Serial.println("IMPORTANT: VIO to 5V, GND to GND, 1k resistor between pins 7 and 8 to PDN_UART");
   delay(500);
 
-  TMC_Driver.beginSerial(115200);     // Initialize UART
+  TMC_Driver.beginSerial(115200); // Initialize UART
 
-  TMC_Driver.begin();                 // UART: Init SW UART (if selected) with default 115200 baudrate
-  TMC_Driver.toff(5);                 // Enables driver in software
-  TMC_Driver.rms_current(1770);       // Set motor RMS current (1770mA)
-  TMC_Driver.microsteps(256);         // Set microsteps to 256
+  TMC_Driver.begin();           // UART: Init SW UART (if selected) with default 115200 baudrate
+  TMC_Driver.toff(5);           // Enables driver in software
+  TMC_Driver.rms_current(1770); // Set motor RMS current (1770mA)
+  TMC_Driver.microsteps(256);   // Set microsteps to 256
 
-  TMC_Driver.en_spreadCycle(false);   // Toggle spreadCycle (false = use StealthChop)
-  TMC_Driver.pwm_autoscale(true);     // Needed for stealthChop
+  // StallGuard configuration
+  TMC_Driver.TCOOLTHRS(0xFFFFF);  // 20bit max - Enable StallGuard (velocity threshold)
+  TMC_Driver.semin(5);            // Minimum StallGuard value for smart current control
+  TMC_Driver.semax(2);            // Maximum StallGuard value for smart current control
+  TMC_Driver.sedn(0b01);          // Current down step speed
+  TMC_Driver.SGTHRS(STALL_VALUE); // StallGuard threshold [0..255]
 
-  Serial.println("TMC2209 configured!");
+  TMC_Driver.en_spreadCycle(false); // Toggle spreadCycle (false = use StealthChop)
+  TMC_Driver.pwm_autoscale(true);   // Needed for stealthChop
+
+  Serial.println("TMC2209 configured with StallGuard!");
   Serial.println("Use joystick VRX (A0) to control speed/direction");
-  Serial.println("Format: PotValue    Speed");
+  Serial.println("Serial commands: 0=Disable, 1=Enable, +=Faster, -=Slower");
   delay(500);
 }
 
 //== Loop ========================================================================================
 
-void loop() {
+void loop()
+{
+  static uint32_t last_time = 0;
+  static int32_t speed = 0; // Motor speed in VACTUAL units
+  uint32_t ms = millis();
 
-  int potVal = analogRead(A0);                              // Read potentiometer (0-1023)
-  long stepperSpeed;
-
-  if (potVal <= 500)                                        // In lower half of range turn counter clockwise
-  {                                                         // (direction depends on motor wiring?)
-    stepperSpeed =  map(potVal, 0, 500, -200000, 0);
-  }
-  else if (potVal >= 520)                                   // In high half of range turn clockwise
+  // Handle serial commands
+  while (Serial.available() > 0)
   {
-    stepperSpeed =  map(potVal, 520, 1023, 0, 200000);
-  }else                                                     // Create a "dead zone" between CW and CCW
-  {                                                         // if 500 < potVal <520
-    stepperSpeed = 0;
+    int8_t read_byte = Serial.read();
+
+    if (read_byte == '0') // Disable motor
+    {
+      Serial.print("Motor ");
+      if (TMC_Driver.toff() == 0)
+      {
+        Serial.print("already ");
+      }
+      Serial.println("disabled.");
+      TMC_Driver.toff(0);
+      speed = 0;
+    }
+    else if (read_byte == '1') // Enable motor
+    {
+      Serial.print("Motor ");
+      if (TMC_Driver.toff() != 0)
+      {
+        Serial.print("already ");
+      }
+      Serial.println("enabled.");
+      TMC_Driver.toff(TOFF_VALUE);
+    }
+    else if (read_byte == '+') // Increase speed
+    {
+      speed += 1000;
+      if (speed == 0)
+      {
+        Serial.println("Hold motor.");
+      }
+      else
+      {
+        Serial.println("Increase speed.");
+      }
+      TMC_Driver.VACTUAL(speed);
+    }
+    else if (read_byte == '-') // Decrease speed
+    {
+      speed -= 1000;
+      if (speed == 0)
+      {
+        Serial.println("Hold motor.");
+      }
+      else
+      {
+        Serial.println("Decrease speed.");
+      }
+      TMC_Driver.VACTUAL(speed);
+    }
   }
 
-  Serial.print(potVal);
-  Serial.print("       ");
-  Serial.println(stepperSpeed);
+  // Read joystick and control motor speed
+  int potVal = analogRead(A0); // Read potentiometer (0-1023)
 
-  TMC_Driver.VACTUAL(stepperSpeed);
+  if (potVal <= 500) // In lower half of range turn counter clockwise
+  {                  // (direction depends on motor wiring?)
+    speed = map(potVal, 0, 500, -200000, 0);
+  }
+  else if (potVal >= 520) // In high half of range turn clockwise
+  {
+    speed = map(potVal, 520, 1023, 0, 200000);
+  }
+  else // Create a "dead zone" between CW and CCW
+  {    // if 500 < potVal < 520
+    speed = 0;
+  }
+
+  // Apply speed to motor
+  TMC_Driver.VACTUAL(speed);
+
+  // Print StallGuard results every 100ms
+  if ((ms - last_time) > 100)
+  {
+    last_time = ms;
+
+    bool diagPin = digitalRead(STALLGUARD);
+
+    // Only print full status when motor is enabled and moving
+    if (TMC_Driver.toff() != 0 && speed != 0)
+    {
+      Serial.print("Status: SG=");
+      Serial.print(TMC_Driver.SG_RESULT(), DEC);
+      Serial.print(" STALL=");
+      Serial.print(TMC_Driver.SG_RESULT() < STALL_VALUE, DEC);
+      Serial.print(" DIAG=");
+      Serial.print(diagPin, DEC);
+      Serial.print(" I=");
+      Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
+      Serial.println("mA");
+    }
+    else
+    {
+      // Always report DIAG pin even when not moving
+      Serial.print("DIAG=");
+      Serial.println(diagPin, DEC);
+    }
+  }
 
 } // end loop
 
