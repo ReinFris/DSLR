@@ -31,7 +31,7 @@
 #define MICROSTEPS 256      // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 // StallGuard Configuration
-#define STALL_VALUE 128 // [0..255] - Higher = less sensitive, Lower = more sensitive
+#define STALL_VALUE 150 // [0..255] - Higher = less sensitive, Lower = more sensitive
 #define TOFF_VALUE 5    // [1..15] Off time setting
 
 // Other I/O Pins
@@ -42,12 +42,15 @@
 #define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS)
 
 // Startup sequence configuration
-#define STARTUP_SPEED 50000 // Speed for startup movement (VACTUAL units)
+#define STARTUP_SPEED 80000       // Speed for startup movement (VACTUAL units)
+#define STARTUP_CHECK_INTERVAL 20 // Check for stalls every 20ms
+#define STARTUP_PAUSE_TIME 500    // Pause time between direction changes (ms)
 
 // Startup sequence states
 enum StartupState
 {
   STARTUP_MOVING_FIRST_SIDE,
+  STARTUP_PAUSING,
   STARTUP_MOVING_SECOND_SIDE,
   STARTUP_COMPLETE
 };
@@ -58,8 +61,9 @@ SoftwareSerial SoftSerial(SW_RX, SW_TX);
 // Create TMC2209 driver object
 TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
 
-// Global state variable
+// Global state variables
 StartupState startupState = STARTUP_MOVING_FIRST_SIDE;
+bool lastDiagState = false;
 
 //== Setup ======================================================================================
 
@@ -76,7 +80,7 @@ void setup()
   digitalWrite(ENABLE_PIN, LOW); // Enable driver in hardware (active LOW)
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
-  pinMode(STALLGUARD, INPUT); // DIAG pin for real-time stall detection
+  pinMode(STALLGUARD, INPUT_PULLUP); // DIAG pin with pull-up for open-drain output
 
   Serial.println("TMC2209 StallGuard Test with Joystick Control");
   Serial.println("Wiring: EN=6, DIR=4, STEP=5, SW_RX=7, SW_TX=8");
@@ -103,10 +107,19 @@ void setup()
   Serial.println("TMC2209 configured with StallGuard!");
   Serial.println("");
   Serial.println("=== STARTUP SEQUENCE ===");
+
+  // Initialize DIAG state
+  delay(100); // Brief delay to let everything stabilize
+  lastDiagState = digitalRead(STALLGUARD);
+  Serial.print("Initial DIAG state: ");
+  Serial.println(lastDiagState);
+
   Serial.println("Moving to first side until stall detected...");
 
   // Start moving in positive direction
   TMC_Driver.VACTUAL(STARTUP_SPEED);
+  Serial.print("Motor commanded to VACTUAL: ");
+  Serial.println(STARTUP_SPEED);
 
   delay(500);
 }
@@ -126,30 +139,84 @@ void loop()
   if (startupState != STARTUP_COMPLETE)
   {
     static uint32_t last_diag_check = 0;
-    static bool lastDiagState = false;
+    static uint32_t pause_start_time = 0;
+    static uint32_t diag_low_start = 0; // Track when DIAG first went LOW (stall)
+    static uint8_t diag_low_count = 0;  // Count consecutive LOW readings
 
-    // Check DIAG pin every 50ms during startup
-    if ((ms - last_diag_check) > 50)
+    // Check DIAG pin at defined interval during startup
+    if ((ms - last_diag_check) > STARTUP_CHECK_INTERVAL)
     {
       last_diag_check = ms;
 
-      // Only detect stall if motor is moving (speed != 0) AND DIAG goes HIGH
-      if (diagPin == HIGH && lastDiagState == LOW)
+      // Read StallGuard result register
+      uint16_t sg_result = TMC_Driver.SG_RESULT();
+
+      // Track DIAG LOW duration for sustained stall detection
+      if (diagPin == LOW)
       {
-        // Stall detected!
+        if (diag_low_count == 0)
+        {
+          diag_low_start = ms;
+        }
+        diag_low_count++;
+      }
+      else
+      {
+        diag_low_count = 0;
+      }
+
+      // Print detailed status during startup
+      Serial.print("Startup: State=");
+      if (startupState == STARTUP_MOVING_FIRST_SIDE)
+        Serial.print("FIRST_SIDE");
+      else if (startupState == STARTUP_PAUSING)
+        Serial.print("PAUSING");
+      else if (startupState == STARTUP_MOVING_SECOND_SIDE)
+        Serial.print("SECOND_SIDE");
+
+      Serial.print(" | DIAG: ");
+      Serial.print(lastDiagState);
+      Serial.print("->");
+      Serial.print(diagPin);
+      Serial.print(" | SG_RESULT=");
+      Serial.print(sg_result);
+      Serial.print(" | LOW_cnt=");
+      Serial.println(diag_low_count);
+
+      // Detect stall: either edge detection OR sustained LOW
+      bool stall_detected = false;
+
+      // Method 1: Edge detection (HIGH -> LOW transition)
+      // With INPUT_PULLUP: HIGH = normal, LOW = stall detected
+      if (diagPin == LOW && lastDiagState == HIGH)
+      {
+        Serial.println("  >> Stall detected via EDGE (HIGH->LOW)");
+        stall_detected = true;
+      }
+
+      // Method 2: Sustained LOW detection (DIAG LOW for 3+ consecutive readings = 60ms+)
+      if (diagPin == LOW && diag_low_count >= 3 && (ms - diag_low_start) >= 60)
+      {
+        Serial.println("  >> Stall detected via SUSTAINED LOW");
+        stall_detected = true;
+      }
+
+      // Handle state transitions on stall detection
+      if (stall_detected)
+      {
         if (startupState == STARTUP_MOVING_FIRST_SIDE)
         {
           Serial.println(">>> STALL DETECTED on first side!");
-          Serial.println(">>> Stopping and reversing...");
+          Serial.println(">>> Stopping...");
 
           // Stop motor
           TMC_Driver.VACTUAL(0);
-          delay(500); // Brief pause
+          Serial.println("Motor commanded to VACTUAL: 0");
 
-          // Move to second side (negative direction)
-          Serial.println(">>> Moving to second side...");
-          TMC_Driver.VACTUAL(-STARTUP_SPEED);
-          startupState = STARTUP_MOVING_SECOND_SIDE;
+          // Enter pause state
+          pause_start_time = ms;
+          startupState = STARTUP_PAUSING;
+          diag_low_count = 0; // Reset counter
         }
         else if (startupState == STARTUP_MOVING_SECOND_SIDE)
         {
@@ -159,6 +226,7 @@ void loop()
           // Stop motor
           TMC_Driver.VACTUAL(0);
           speed = 0;
+          Serial.println("Motor commanded to VACTUAL: 0");
 
           Serial.println(">>> STARTUP SEQUENCE COMPLETE!");
           Serial.println("");
@@ -171,12 +239,19 @@ void loop()
       }
 
       lastDiagState = diagPin;
+    }
 
-      // Print status during startup
-      Serial.print("Startup: State=");
-      Serial.print(startupState == STARTUP_MOVING_FIRST_SIDE ? "FIRST_SIDE" : "SECOND_SIDE");
-      Serial.print(" DIAG=");
-      Serial.println(diagPin);
+    // Handle pause state (non-blocking)
+    if (startupState == STARTUP_PAUSING)
+    {
+      if ((ms - pause_start_time) >= STARTUP_PAUSE_TIME)
+      {
+        Serial.println(">>> Pause complete, moving to second side...");
+        TMC_Driver.VACTUAL(-STARTUP_SPEED);
+        Serial.print("Motor commanded to VACTUAL: ");
+        Serial.println(-STARTUP_SPEED);
+        startupState = STARTUP_MOVING_SECOND_SIDE;
+      }
     }
 
     // During startup, skip normal joystick control
