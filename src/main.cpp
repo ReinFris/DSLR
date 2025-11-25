@@ -41,11 +41,25 @@
 #define STEPS_PER_REV 200
 #define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS)
 
+// Startup sequence configuration
+#define STARTUP_SPEED 50000 // Speed for startup movement (VACTUAL units)
+
+// Startup sequence states
+enum StartupState
+{
+  STARTUP_MOVING_FIRST_SIDE,
+  STARTUP_MOVING_SECOND_SIDE,
+  STARTUP_COMPLETE
+};
+
 // Create SoftwareSerial for TMC2209 UART communication
 SoftwareSerial SoftSerial(SW_RX, SW_TX);
 
 // Create TMC2209 driver object
 TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
+
+// Global state variable
+StartupState startupState = STARTUP_MOVING_FIRST_SIDE;
 
 //== Setup ======================================================================================
 
@@ -87,8 +101,13 @@ void setup()
   TMC_Driver.pwm_autoscale(true);   // Needed for stealthChop
 
   Serial.println("TMC2209 configured with StallGuard!");
-  Serial.println("Use joystick VRX (A0) to control speed/direction");
-  Serial.println("Serial commands: 0=Disable, 1=Enable, +=Faster, -=Slower");
+  Serial.println("");
+  Serial.println("=== STARTUP SEQUENCE ===");
+  Serial.println("Moving to first side until stall detected...");
+
+  // Start moving in positive direction
+  TMC_Driver.VACTUAL(STARTUP_SPEED);
+
   delay(500);
 }
 
@@ -99,6 +118,72 @@ void loop()
   static uint32_t last_time = 0;
   static int32_t speed = 0; // Motor speed in VACTUAL units
   uint32_t ms = millis();
+
+  // Read DIAG pin for stall detection
+  bool diagPin = digitalRead(STALLGUARD);
+
+  //== STARTUP SEQUENCE HANDLING ==================================================================
+  if (startupState != STARTUP_COMPLETE)
+  {
+    static uint32_t last_diag_check = 0;
+    static bool lastDiagState = false;
+
+    // Check DIAG pin every 50ms during startup
+    if ((ms - last_diag_check) > 50)
+    {
+      last_diag_check = ms;
+
+      // Only detect stall if motor is moving (speed != 0) AND DIAG goes HIGH
+      if (diagPin == HIGH && lastDiagState == LOW)
+      {
+        // Stall detected!
+        if (startupState == STARTUP_MOVING_FIRST_SIDE)
+        {
+          Serial.println(">>> STALL DETECTED on first side!");
+          Serial.println(">>> Stopping and reversing...");
+
+          // Stop motor
+          TMC_Driver.VACTUAL(0);
+          delay(500); // Brief pause
+
+          // Move to second side (negative direction)
+          Serial.println(">>> Moving to second side...");
+          TMC_Driver.VACTUAL(-STARTUP_SPEED);
+          startupState = STARTUP_MOVING_SECOND_SIDE;
+        }
+        else if (startupState == STARTUP_MOVING_SECOND_SIDE)
+        {
+          Serial.println(">>> STALL DETECTED on second side!");
+          Serial.println(">>> Stopping...");
+
+          // Stop motor
+          TMC_Driver.VACTUAL(0);
+          speed = 0;
+
+          Serial.println(">>> STARTUP SEQUENCE COMPLETE!");
+          Serial.println("");
+          Serial.println("Normal operation:");
+          Serial.println("  Joystick VRX (A0) to control speed/direction");
+          Serial.println("  Serial commands: 0=Disable, 1=Enable, +=Faster, -=Slower");
+
+          startupState = STARTUP_COMPLETE;
+        }
+      }
+
+      lastDiagState = diagPin;
+
+      // Print status during startup
+      Serial.print("Startup: State=");
+      Serial.print(startupState == STARTUP_MOVING_FIRST_SIDE ? "FIRST_SIDE" : "SECOND_SIDE");
+      Serial.print(" DIAG=");
+      Serial.println(diagPin);
+    }
+
+    // During startup, skip normal joystick control
+    return;
+  }
+
+  //== NORMAL OPERATION ===========================================================================
 
   // Handle serial commands
   while (Serial.available() > 0)
@@ -177,8 +262,6 @@ void loop()
   if ((ms - last_time) > 100)
   {
     last_time = ms;
-
-    bool diagPin = digitalRead(STALLGUARD);
 
     // Only print full status when motor is enabled and moving
     if (TMC_Driver.toff() != 0 && speed != 0)
