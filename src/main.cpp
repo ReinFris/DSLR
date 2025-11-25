@@ -56,6 +56,7 @@ enum HomingState {
   HOMING_IDLE,
   HOMING_FORWARD,
   HOMING_BACKWARD,
+  HOMING_TO_CENTER,
   HOMING_COMPLETE
 };
 
@@ -199,28 +200,67 @@ void loop()
 
       // Stop motor
       TMC_Driver.VACTUAL(0);
-      delay(500);
+      delay(2000);
 
       // Record second position
       secondLimitPosition = virtualPosition;
 
-      // Calculate travel range
+      // Calculate travel range and center position
       int32_t travelRange = abs(firstLimitPosition - secondLimitPosition);
+      int32_t centerPosition = (firstLimitPosition + secondLimitPosition) / 2;
 
-      Serial.println("HOMING: Complete!");
+      Serial.println("HOMING: Both limits found!");
       Serial.print("  First limit: ");
       Serial.println(firstLimitPosition);
       Serial.print("  Second limit: ");
       Serial.println(secondLimitPosition);
       Serial.print("  Travel range: ");
       Serial.println(travelRange);
+      Serial.print("  Center position: ");
+      Serial.println(centerPosition);
+      Serial.println("HOMING: Moving to center position...");
 
-      homingState = HOMING_COMPLETE;
+      // Determine direction to center
+      int32_t distanceToCenter = centerPosition - virtualPosition;
+      int32_t centerSpeed = (distanceToCenter > 0) ? HOMING_SPEED : -HOMING_SPEED;
+
+      homingState = HOMING_TO_CENTER;
+      stallConfirmCount = 0; // Reset stall counter
+      TMC_Driver.VACTUAL(centerSpeed);
     }
     else
     {
       // Continue tracking position
       virtualPosition -= HOMING_SPEED / 1000; // Rough position estimate
+    }
+    break;
+
+  case HOMING_TO_CENTER:
+    // Move to center position
+    {
+      int32_t centerPosition = (firstLimitPosition + secondLimitPosition) / 2;
+      int32_t distanceToCenter = abs(centerPosition - virtualPosition);
+
+      // Check if we've reached the center (within tolerance)
+      if (distanceToCenter < 100) // Tolerance value
+      {
+        Serial.println("HOMING: Center position reached!");
+        TMC_Driver.VACTUAL(0);
+        homingState = HOMING_COMPLETE;
+        Serial.println("HOMING: Complete!");
+      }
+      else
+      {
+        // Continue tracking position
+        if (TMC_Driver.VACTUAL() > 0)
+        {
+          virtualPosition += HOMING_SPEED / 1000;
+        }
+        else
+        {
+          virtualPosition -= HOMING_SPEED / 1000;
+        }
+      }
     }
     break;
 
@@ -284,6 +324,9 @@ void loop()
       break;
     case HOMING_BACKWARD:
       Serial.print("BACK");
+      break;
+    case HOMING_TO_CENTER:
+      Serial.print("CENTER");
       break;
     case HOMING_COMPLETE:
       Serial.print("DONE");
