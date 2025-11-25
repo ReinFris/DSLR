@@ -31,8 +31,8 @@
 #define MICROSTEPS 256      // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 // StallGuard Configuration
-#define STALL_VALUE 60 // [0..255] - Higher = less sensitive, Lower = more sensitive
-#define TOFF_VALUE 5   // [1..15] Off time setting
+#define STALL_VALUE 150 // [0..255] - Higher = less sensitive, Lower = more sensitive
+#define TOFF_VALUE 5    // [1..15] Off time setting
 
 // Other I/O Pins
 #define LED_PIN 13
