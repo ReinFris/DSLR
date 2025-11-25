@@ -5,9 +5,19 @@
 #include <AccelStepper.h>
 #include "EncoderReader.h"
 
+// AS5600 Encoder I2C Pins (for reference - Wire library uses these by default)
+// For Arduino Uno/Nano: SDA = A4, SCL = A5
+// For Arduino Mega: SDA = 20, SCL = 21
+// Note: Most AS5600 modules have built-in pull-up resistors
+#define SDA_PIN A4  // I2C Data
+#define SCL_PIN A5  // I2C Clock
+
+// Stepper Motor Pins
 #define STEP_PIN 5
 #define DIR_PIN 4
 #define ENABLE_PIN 6
+
+// Other I/O Pins
 #define LED_PIN 13
 #define JOYSTICK_VRX A0
 #define JOYSTICK_SW 2
@@ -23,9 +33,9 @@ EncoderReader encoder;
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 // Motor control parameters
-#define MAX_SPEED 1000.0  // Maximum speed in steps/second
-#define HALF_SPEED 500.0  // Half speed in steps/second
-#define ACCELERATION 20.0 // Acceleration in steps/second^2
+#define MAX_SPEED 1000.0   // Maximum speed in steps/second
+#define HALF_SPEED 500.0   // Half speed in steps/second
+#define ACCELERATION 800.0 // Acceleration in steps/second^2
 
 // Joystick parameters
 #define JOYSTICK_CENTER 512         // Center position (ADC value 0-1023)
@@ -240,7 +250,7 @@ void loop()
 
       // Apply direction
       if (vrxValue > JOYSTICK_CENTER + JOYSTICK_DEADZONE)
-        targetSpeed = speedStep;  // Forward
+        targetSpeed = speedStep; // Forward
       else
         targetSpeed = -speedStep; // Backward
     }
