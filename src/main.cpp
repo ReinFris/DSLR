@@ -31,8 +31,12 @@
 #define MICROSTEPS 256      // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 // StallGuard Configuration
-#define STALL_VALUE 150 // [0..255] - Higher = less sensitive, Lower = more sensitive
+#define STALL_VALUE 100 // [0..255] - Higher = less sensitive, Lower = more sensitive
 #define TOFF_VALUE 5    // [1..15] Off time setting
+#define STALL_CURRENT_THRESHOLD 1000 // Current threshold in mA for stall detection
+
+// Homing Configuration
+#define HOMING_SPEED 100000 // VACTUAL speed for homing (lower = slower, safer)
 
 // Other I/O Pins
 #define LED_PIN 13
@@ -46,6 +50,19 @@ SoftwareSerial SoftSerial(SW_RX, SW_TX);
 
 // Create TMC2209 driver object
 TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
+
+// Homing state machine
+enum HomingState {
+  HOMING_IDLE,
+  HOMING_FORWARD,
+  HOMING_BACKWARD,
+  HOMING_COMPLETE
+};
+
+HomingState homingState = HOMING_IDLE;
+int32_t firstLimitPosition = 0;
+int32_t secondLimitPosition = 0;
+uint8_t stallConfirmCount = 0; // Counter to confirm stall detection
 
 //== Setup ======================================================================================
 
@@ -87,9 +104,23 @@ void setup()
   TMC_Driver.pwm_autoscale(true);   // Needed for stealthChop
 
   Serial.println("TMC2209 configured with StallGuard!");
-  Serial.println("Use joystick VRX (A0) to control speed/direction");
-  Serial.println("Serial commands: 0=Disable, 1=Enable, +=Faster, -=Slower");
-  delay(500);
+
+  // Verify driver is enabled
+  Serial.print("Driver toff: ");
+  Serial.println(TMC_Driver.toff());
+
+  Serial.println("Starting automatic homing sequence...");
+  Serial.println("Will detect stalls when current > 1000mA");
+  Serial.print("Homing speed: ");
+  Serial.println(HOMING_SPEED);
+  delay(1000);
+
+  // Start homing sequence
+  homingState = HOMING_FORWARD;
+  TMC_Driver.VACTUAL(HOMING_SPEED); // Start moving forward
+  Serial.println("HOMING: Moving forward to find first limit...");
+  Serial.print("VACTUAL set to: ");
+  Serial.println(HOMING_SPEED);
 }
 
 //== Loop ========================================================================================
@@ -97,108 +128,170 @@ void setup()
 void loop()
 {
   static uint32_t last_time = 0;
-  static int32_t speed = 0; // Motor speed in VACTUAL units
+  static int32_t virtualPosition = 0; // Track virtual position since TMC2209 doesn't have position counter
   uint32_t ms = millis();
 
-  // Handle serial commands
+  // Get current motor status
+  uint16_t currentReading = TMC_Driver.cs2rms(TMC_Driver.cs_actual());
+  uint16_t sgResult = TMC_Driver.SG_RESULT();
+  bool diagPin = digitalRead(STALLGUARD);
+
+  // Stall detection with confirmation (need 3 consecutive high readings)
+  bool currentHigh = (currentReading > STALL_CURRENT_THRESHOLD);
+  if (currentHigh)
+  {
+    stallConfirmCount++;
+  }
+  else
+  {
+    stallConfirmCount = 0;
+  }
+  bool stallDetected = (stallConfirmCount >= 3);
+
+  // Homing state machine
+  switch (homingState)
+  {
+  case HOMING_FORWARD:
+    // Check for stall in forward direction
+    if (stallDetected)
+    {
+      Serial.print("HOMING: First limit detected! I=");
+      Serial.print(currentReading);
+      Serial.println("mA");
+
+      // Stop motor
+      TMC_Driver.VACTUAL(0);
+      delay(2000); // Wait longer for motor to fully stop and current to drop
+
+      // Record first position
+      firstLimitPosition = virtualPosition;
+
+      // Back off from the limit first
+      Serial.println("HOMING: Backing off from first limit...");
+      TMC_Driver.VACTUAL(-HOMING_SPEED);
+      delay(2000); // Move away for 2 seconds
+      virtualPosition -= (HOMING_SPEED / 1000) * 2; // Update position estimate
+
+      // Stop and wait
+      TMC_Driver.VACTUAL(0);
+      delay(2000); // Second delay before starting backward homing
+
+      // Start moving backward to find second limit
+      homingState = HOMING_BACKWARD;
+      stallConfirmCount = 0; // Reset stall counter for backward direction
+      TMC_Driver.VACTUAL(-HOMING_SPEED);
+      Serial.println("HOMING: Moving backward to find second limit...");
+    }
+    else
+    {
+      // Continue tracking position
+      virtualPosition += HOMING_SPEED / 1000; // Rough position estimate
+    }
+    break;
+
+  case HOMING_BACKWARD:
+    // Check for stall in backward direction
+    if (stallDetected)
+    {
+      Serial.print("HOMING: Second limit detected! I=");
+      Serial.print(currentReading);
+      Serial.println("mA");
+
+      // Stop motor
+      TMC_Driver.VACTUAL(0);
+      delay(500);
+
+      // Record second position
+      secondLimitPosition = virtualPosition;
+
+      // Calculate travel range
+      int32_t travelRange = abs(firstLimitPosition - secondLimitPosition);
+
+      Serial.println("HOMING: Complete!");
+      Serial.print("  First limit: ");
+      Serial.println(firstLimitPosition);
+      Serial.print("  Second limit: ");
+      Serial.println(secondLimitPosition);
+      Serial.print("  Travel range: ");
+      Serial.println(travelRange);
+
+      homingState = HOMING_COMPLETE;
+    }
+    else
+    {
+      // Continue tracking position
+      virtualPosition -= HOMING_SPEED / 1000; // Rough position estimate
+    }
+    break;
+
+  case HOMING_COMPLETE:
+    // Homing done - just monitor status
+    // Could add joystick control here if desired
+    break;
+
+  case HOMING_IDLE:
+  default:
+    break;
+  }
+
+  // Handle serial commands for manual control after homing
   while (Serial.available() > 0)
   {
     int8_t read_byte = Serial.read();
 
-    if (read_byte == '0') // Disable motor
+    if (read_byte == 'r' || read_byte == 'R') // Restart homing
     {
-      Serial.print("Motor ");
-      if (TMC_Driver.toff() == 0)
-      {
-        Serial.print("already ");
-      }
-      Serial.println("disabled.");
-      TMC_Driver.toff(0);
-      speed = 0;
+      Serial.println("Restarting homing sequence...");
+      virtualPosition = 0;
+      firstLimitPosition = 0;
+      secondLimitPosition = 0;
+      homingState = HOMING_FORWARD;
+      TMC_Driver.VACTUAL(HOMING_SPEED);
     }
-    else if (read_byte == '1') // Enable motor
+    else if (read_byte == '0') // Stop motor
     {
-      Serial.print("Motor ");
-      if (TMC_Driver.toff() != 0)
-      {
-        Serial.print("already ");
-      }
-      Serial.println("enabled.");
-      TMC_Driver.toff(TOFF_VALUE);
-    }
-    else if (read_byte == '+') // Increase speed
-    {
-      speed += 1000;
-      if (speed == 0)
-      {
-        Serial.println("Hold motor.");
-      }
-      else
-      {
-        Serial.println("Increase speed.");
-      }
-      TMC_Driver.VACTUAL(speed);
-    }
-    else if (read_byte == '-') // Decrease speed
-    {
-      speed -= 1000;
-      if (speed == 0)
-      {
-        Serial.println("Hold motor.");
-      }
-      else
-      {
-        Serial.println("Decrease speed.");
-      }
-      TMC_Driver.VACTUAL(speed);
+      Serial.println("Motor stopped.");
+      TMC_Driver.VACTUAL(0);
+      homingState = HOMING_IDLE;
     }
   }
 
-  // Read joystick and control motor speed
-  int potVal = analogRead(A0); // Read potentiometer (0-1023)
-
-  if (potVal <= 500) // In lower half of range turn counter clockwise
-  {                  // (direction depends on motor wiring?)
-    speed = map(potVal, 0, 500, -200000, 0);
-  }
-  else if (potVal >= 520) // In high half of range turn clockwise
-  {
-    speed = map(potVal, 520, 1023, 0, 200000);
-  }
-  else // Create a "dead zone" between CW and CCW
-  {    // if 500 < potVal < 520
-    speed = 0;
-  }
-
-  // Apply speed to motor
-  TMC_Driver.VACTUAL(speed);
-
-  // Print StallGuard results every 100ms
+  // Print status every 100ms
   if ((ms - last_time) > 100)
   {
     last_time = ms;
 
-    bool diagPin = digitalRead(STALLGUARD);
+    // Print current status
+    Serial.print("Status: SG=");
+    Serial.print(sgResult, DEC);
+    Serial.print(" STALL=");
+    Serial.print(stallDetected ? 1 : 0, DEC);
+    Serial.print(" DIAG=");
+    Serial.print(diagPin, DEC);
+    Serial.print(" I=");
+    Serial.print(currentReading, DEC);
+    Serial.print("mA");
 
-    // Only print full status when motor is enabled and moving
-    if (TMC_Driver.toff() != 0 && speed != 0)
+    // Add state info
+    Serial.print(" State=");
+    switch (homingState)
     {
-      Serial.print("Status: SG=");
-      Serial.print(TMC_Driver.SG_RESULT(), DEC);
-      Serial.print(" STALL=");
-      Serial.print(TMC_Driver.SG_RESULT() < STALL_VALUE, DEC);
-      Serial.print(" DIAG=");
-      Serial.print(diagPin, DEC);
-      Serial.print(" I=");
-      Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
-      Serial.println("mA");
+    case HOMING_IDLE:
+      Serial.print("IDLE");
+      break;
+    case HOMING_FORWARD:
+      Serial.print("FWD");
+      break;
+    case HOMING_BACKWARD:
+      Serial.print("BACK");
+      break;
+    case HOMING_COMPLETE:
+      Serial.print("DONE");
+      break;
     }
-    else
-    {
-      // Always report DIAG pin even when not moving
-      Serial.print("DIAG=");
-      Serial.println(diagPin, DEC);
-    }
+
+    Serial.print(" Pos=");
+    Serial.println(virtualPosition);
   }
 
 } // end loop
