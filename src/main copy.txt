@@ -27,12 +27,12 @@
 // TMC2209 Configuration
 #define R_SENSE 0.11f       // SilentStepStick series use 0.11 Ohm
 #define DRIVER_ADDRESS 0b00 // TMC2209 Driver address according to MS1 and MS2
-#define RUN_CURRENT 700     // Motor current in mA (adjust based on your motor specs)
+#define RUN_CURRENT 1770    // Motor current in mA (adjust based on your motor specs)
 #define MICROSTEPS 256      // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 // StallGuard Configuration
-#define STALL_VALUE 10 // [0..255] - Higher = less sensitive, Lower = more sensitive
-#define TOFF_VALUE 5   // [1..15] Off time setting
+#define STALL_VALUE 150 // [0..255] - Higher = less sensitive, Lower = more sensitive
+#define TOFF_VALUE 5    // [1..15] Off time setting
 
 // Other I/O Pins
 #define LED_PIN 13
@@ -42,22 +42,17 @@
 #define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS)
 
 // Startup sequence configuration
-#define STARTUP_SPEED 160000 // Speed for startup movement (VACTUAL units)
+#define STARTUP_SPEED 80000       // Speed for startup movement (VACTUAL units)
+#define STARTUP_CHECK_INTERVAL 20 // Check for stalls every 20ms
+#define STARTUP_PAUSE_TIME 500    // Pause time between direction changes (ms)
 
 // Startup sequence states
 enum StartupState
 {
   STARTUP_MOVING_FIRST_SIDE,
+  STARTUP_PAUSING,
   STARTUP_MOVING_SECOND_SIDE,
-  STARTUP_MOVING_BACK,
   STARTUP_COMPLETE
-};
-
-// Oscillation state
-enum OscillationState
-{
-  OSC_FORWARD,
-  OSC_BACKWARD
 };
 
 // Create SoftwareSerial for TMC2209 UART communication
@@ -68,27 +63,7 @@ TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
 
 // Global state variables
 StartupState startupState = STARTUP_MOVING_FIRST_SIDE;
-OscillationState oscState = OSC_FORWARD;
-int32_t currentPosition = 0;         // Track motor position in steps
-int32_t oscillationSteps = 0;        // Counter for oscillation steps
-volatile bool stallDetected = false; // Flag set by interrupt
-volatile uint32_t lastStallTime = 0; // Debounce stall detection
-
-//== Interrupt Service Routine ==================================================================
-
-// ISR for DIAG pin - triggered when stall is detected
-void stallInterruptHandler()
-{
-  stallDetected = true;
-
-  // Serial.print("Status: SG=");
-  // Serial.print(TMC_Driver.SG_RESULT(), DEC);
-  // Serial.print(" STALL=");
-  // Serial.print(TMC_Driver.SG_RESULT() < STALL_VALUE ? 1 : 0);
-  // Serial.print(" I=");
-  // Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
-  // Serial.println("mA");
-}
+bool lastDiagState = false;
 
 //== Setup ======================================================================================
 
@@ -105,10 +80,7 @@ void setup()
   digitalWrite(ENABLE_PIN, LOW); // Enable driver in hardware (active LOW)
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
-
-  // Attach interrupt to DIAG pin (pin 3 supports interrupts on most Arduino boards)
-  // RISING edge: when DIAG goes HIGH, a stall is detected
-  attachInterrupt(digitalPinToInterrupt(STALLGUARD), stallInterruptHandler, RISING);
+  pinMode(STALLGUARD, INPUT_PULLUP); // DIAG pin with pull-up for open-drain output
 
   Serial.println("TMC2209 StallGuard Test with Joystick Control");
   Serial.println("Wiring: EN=6, DIR=4, STEP=5, SW_RX=7, SW_TX=8");
@@ -117,16 +89,16 @@ void setup()
 
   TMC_Driver.beginSerial(115200); // Initialize UART
 
-  TMC_Driver.begin();          // UART: Init SW UART (if selected) with default 115200 baudrate
-  TMC_Driver.toff(5);          // Enables driver in software
-  TMC_Driver.rms_current(770); // Set motor RMS current (1770mA)
-  TMC_Driver.microsteps(256);  // Set microsteps to 256
+  TMC_Driver.begin();           // UART: Init SW UART (if selected) with default 115200 baudrate
+  TMC_Driver.toff(5);           // Enables driver in software
+  TMC_Driver.rms_current(1770); // Set motor RMS current (1770mA)
+  TMC_Driver.microsteps(256);   // Set microsteps to 256
 
   // StallGuard configuration
   TMC_Driver.TCOOLTHRS(0xFFFFF);  // 20bit max - Enable StallGuard (velocity threshold)
   TMC_Driver.semin(5);            // Minimum StallGuard value for smart current control
   TMC_Driver.semax(2);            // Maximum StallGuard value for smart current control
-  TMC_Driver.sedn(0b00);          // Current down step speed
+  TMC_Driver.sedn(0b01);          // Current down step speed
   TMC_Driver.SGTHRS(STALL_VALUE); // StallGuard threshold [0..255]
 
   TMC_Driver.en_spreadCycle(false); // Toggle spreadCycle (false = use StealthChop)
@@ -135,10 +107,19 @@ void setup()
   Serial.println("TMC2209 configured with StallGuard!");
   Serial.println("");
   Serial.println("=== STARTUP SEQUENCE ===");
+
+  // Initialize DIAG state
+  delay(100); // Brief delay to let everything stabilize
+  lastDiagState = digitalRead(STALLGUARD);
+  Serial.print("Initial DIAG state: ");
+  Serial.println(lastDiagState);
+
   Serial.println("Moving to first side until stall detected...");
 
   // Start moving in positive direction
   TMC_Driver.VACTUAL(STARTUP_SPEED);
+  Serial.print("Motor commanded to VACTUAL: ");
+  Serial.println(STARTUP_SPEED);
 
   delay(500);
 }
@@ -158,239 +139,228 @@ void loop()
   if (startupState != STARTUP_COMPLETE)
   {
     static uint32_t last_diag_check = 0;
+    static uint32_t pause_start_time = 0;
+    static uint32_t diag_low_start = 0; // Track when DIAG first went LOW (stall)
+    static uint8_t diag_low_count = 0;  // Count consecutive LOW readings
 
-    // Check for stall detection via interrupt flag
-    if (stallDetected)
-    {
-      stallDetected = false; // Clear the flag
-
-      Serial.print("SG_RESULT: ");
-      Serial.println(TMC_Driver.SG_RESULT());
-
-      // Stall detected via interrupt!
-      if (startupState == STARTUP_MOVING_FIRST_SIDE)
-      {
-        Serial.println(">>> STALL DETECTED on first side!");
-        Serial.println(">>> Clearing stall condition...");
-
-        // Clear StallGuard fault by toggling the enable pin
-        // A high DIAG pin indicates a stall - must be cleared by disabling
-        // and re-enabling the driver via the ENN (enable) pin
-        // digitalWrite(ENABLE_PIN, HIGH); // Disable driver (active LOW)
-        // delay(10);                      // Brief pause to clear the fault
-        // digitalWrite(ENABLE_PIN, LOW);  // Re-enable driver
-
-        Serial.println(">>> Reversing direction...");
-
-        // Move to second side (negative direction)
-        TMC_Driver.VACTUAL(-STARTUP_SPEED);
-        startupState = STARTUP_MOVING_SECOND_SIDE;
-      }
-      else if (startupState == STARTUP_MOVING_SECOND_SIDE)
-      {
-        Serial.println(">>> STALL DETECTED on second side!");
-        Serial.println(">>> Clearing stall condition...");
-
-        // Clear StallGuard fault by toggling the enable pin
-        digitalWrite(ENABLE_PIN, HIGH); // Disable driver (active LOW)
-        delay(10);                      // Brief pause to clear the fault
-        digitalWrite(ENABLE_PIN, LOW);  // Re-enable driver
-
-        Serial.println(">>> Moving back 1000 steps...");
-
-        // Move back 1000 steps (positive direction)
-        TMC_Driver.VACTUAL(STARTUP_SPEED);
-        currentPosition = 0; // Reset position counter
-        startupState = STARTUP_MOVING_BACK;
-      }
-    }
-
-    // Handle MOVING_BACK state (time-based movement)
-    if (startupState == STARTUP_MOVING_BACK)
-    {
-      // Check if we've moved 1000 steps (approximate based on time/speed)
-      // This is a simple approach - for precise stepping, you'd need step counting
-      static uint32_t moveStartTime = 0;
-      if (moveStartTime == 0)
-      {
-        moveStartTime = ms;
-      }
-
-      // After sufficient time for ~1000 steps, start oscillation
-      if ((ms - moveStartTime) > 2000) // Adjust timing as needed
-      {
-        TMC_Driver.VACTUAL(0);
-        speed = 0;
-        moveStartTime = 0;
-
-        Serial.println(">>> STARTUP SEQUENCE COMPLETE!");
-        Serial.println(">>> Starting oscillation: 500 steps back and forth");
-
-        // Start oscillation
-        TMC_Driver.VACTUAL(STARTUP_SPEED);
-        oscillationSteps = 0;
-        oscState = OSC_FORWARD;
-        startupState = STARTUP_COMPLETE;
-      }
-    }
-
-    // Print status during startup every 50ms
-    if ((ms - last_diag_check) > 50)
+    // Check DIAG pin at defined interval during startup
+    if ((ms - last_diag_check) > STARTUP_CHECK_INTERVAL)
     {
       last_diag_check = ms;
 
+      // Read StallGuard result register
+      uint16_t sg_result = TMC_Driver.SG_RESULT();
+
+      // Track DIAG LOW duration for sustained stall detection
+      if (diagPin == LOW)
+      {
+        if (diag_low_count == 0)
+        {
+          diag_low_start = ms;
+        }
+        diag_low_count++;
+      }
+      else
+      {
+        diag_low_count = 0;
+      }
+
+      // Print detailed status during startup
       Serial.print("Startup: State=");
       if (startupState == STARTUP_MOVING_FIRST_SIDE)
         Serial.print("FIRST_SIDE");
+      else if (startupState == STARTUP_PAUSING)
+        Serial.print("PAUSING");
       else if (startupState == STARTUP_MOVING_SECOND_SIDE)
         Serial.print("SECOND_SIDE");
-      else if (startupState == STARTUP_MOVING_BACK)
-        Serial.print("MOVING_BACK");
-      Serial.print(" DIAG=");
-      Serial.println(diagPin);
 
-      Serial.print("Status: SG=");
-      Serial.print(TMC_Driver.SG_RESULT(), DEC);
-      Serial.print(" STALL=");
-      Serial.print(TMC_Driver.SG_RESULT() < STALL_VALUE ? 1 : 0);
-      Serial.print(" DIAG=");
-      Serial.print(diagPin, DEC);
-      Serial.print(" I=");
-      Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
-      Serial.println("mA");
+      Serial.print(" | DIAG: ");
+      Serial.print(lastDiagState);
+      Serial.print("->");
+      Serial.print(diagPin);
+      Serial.print(" | SG_RESULT=");
+      Serial.print(sg_result);
+      Serial.print(" | LOW_cnt=");
+      Serial.println(diag_low_count);
+
+      // Detect stall: either edge detection OR sustained LOW
+      bool stall_detected = false;
+
+      // Method 1: Edge detection (HIGH -> LOW transition)
+      // With INPUT_PULLUP: HIGH = normal, LOW = stall detected
+      if (diagPin == LOW && lastDiagState == HIGH)
+      {
+        Serial.println("  >> Stall detected via EDGE (HIGH->LOW)");
+        stall_detected = true;
+      }
+
+      // Method 2: Sustained LOW detection (DIAG LOW for 3+ consecutive readings = 60ms+)
+      if (diagPin == LOW && diag_low_count >= 3 && (ms - diag_low_start) >= 60)
+      {
+        Serial.println("  >> Stall detected via SUSTAINED LOW");
+        stall_detected = true;
+      }
+
+      // Handle state transitions on stall detection
+      if (stall_detected)
+      {
+        if (startupState == STARTUP_MOVING_FIRST_SIDE)
+        {
+          Serial.println(">>> STALL DETECTED on first side!");
+          Serial.println(">>> Stopping...");
+
+          // Stop motor
+          TMC_Driver.VACTUAL(0);
+          Serial.println("Motor commanded to VACTUAL: 0");
+
+          // Enter pause state
+          pause_start_time = ms;
+          startupState = STARTUP_PAUSING;
+          diag_low_count = 0; // Reset counter
+        }
+        else if (startupState == STARTUP_MOVING_SECOND_SIDE)
+        {
+          Serial.println(">>> STALL DETECTED on second side!");
+          Serial.println(">>> Stopping...");
+
+          // Stop motor
+          TMC_Driver.VACTUAL(0);
+          speed = 0;
+          Serial.println("Motor commanded to VACTUAL: 0");
+
+          Serial.println(">>> STARTUP SEQUENCE COMPLETE!");
+          Serial.println("");
+          Serial.println("Normal operation:");
+          Serial.println("  Joystick VRX (A0) to control speed/direction");
+          Serial.println("  Serial commands: 0=Disable, 1=Enable, +=Faster, -=Slower");
+
+          startupState = STARTUP_COMPLETE;
+        }
+      }
+
+      lastDiagState = diagPin;
+    }
+
+    // Handle pause state (non-blocking)
+    if (startupState == STARTUP_PAUSING)
+    {
+      if ((ms - pause_start_time) >= STARTUP_PAUSE_TIME)
+      {
+        Serial.println(">>> Pause complete, moving to second side...");
+        TMC_Driver.VACTUAL(-STARTUP_SPEED);
+        Serial.print("Motor commanded to VACTUAL: ");
+        Serial.println(-STARTUP_SPEED);
+        startupState = STARTUP_MOVING_SECOND_SIDE;
+      }
     }
 
     // During startup, skip normal joystick control
     return;
   }
 
-  //== NORMAL OPERATION - OSCILLATION ==============================================================
+  //== NORMAL OPERATION ===========================================================================
 
-  // Oscillation logic: move 500 steps back and forth
-  static uint32_t last_osc_time = 0;
-  static uint32_t osc_step_count = 0;
-
-  // Estimate steps based on time and speed (rough approximation)
-  // For more precise control, you would need to count actual step pulses
-  if ((ms - last_osc_time) > 10) // Check every 10ms
+  // Handle serial commands
+  while (Serial.available() > 0)
   {
-    last_osc_time = ms;
-    osc_step_count++;
+    int8_t read_byte = Serial.read();
 
-    // Roughly estimate 500 steps completed (adjust based on your speed/timing)
-    if (osc_step_count >= 100) // ~1 second at 10ms intervals
+    if (read_byte == '0') // Disable motor
     {
-      osc_step_count = 0;
-
-      // Toggle direction
-      if (oscState == OSC_FORWARD)
+      Serial.print("Motor ");
+      if (TMC_Driver.toff() == 0)
       {
-        Serial.println(">>> Oscillation: Reversing to BACKWARD");
-        TMC_Driver.VACTUAL(-STARTUP_SPEED);
-        oscState = OSC_BACKWARD;
+        Serial.print("already ");
+      }
+      Serial.println("disabled.");
+      TMC_Driver.toff(0);
+      speed = 0;
+    }
+    else if (read_byte == '1') // Enable motor
+    {
+      Serial.print("Motor ");
+      if (TMC_Driver.toff() != 0)
+      {
+        Serial.print("already ");
+      }
+      Serial.println("enabled.");
+      TMC_Driver.toff(TOFF_VALUE);
+    }
+    else if (read_byte == '+') // Increase speed
+    {
+      speed += 1000;
+      if (speed == 0)
+      {
+        Serial.println("Hold motor.");
       }
       else
       {
-        Serial.println(">>> Oscillation: Reversing to FORWARD");
-        TMC_Driver.VACTUAL(STARTUP_SPEED);
-        oscState = OSC_FORWARD;
+        Serial.println("Increase speed.");
       }
+      TMC_Driver.VACTUAL(speed);
+    }
+    else if (read_byte == '-') // Decrease speed
+    {
+      speed -= 1000;
+      if (speed == 0)
+      {
+        Serial.println("Hold motor.");
+      }
+      else
+      {
+        Serial.println("Decrease speed.");
+      }
+      TMC_Driver.VACTUAL(speed);
     }
   }
 
-  // // Handle serial commands (COMMENTED OUT)
-  // while (Serial.available() > 0)
-  // {
-  //   int8_t read_byte = Serial.read();
+  // Read joystick and control motor speed
+  int potVal = analogRead(A0); // Read potentiometer (0-1023)
 
-  //   if (read_byte == '0') // Disable motor
-  //   {
-  //     Serial.print("Motor ");
-  //     if (TMC_Driver.toff() == 0)
-  //     {
-  //       Serial.print("already ");
-  //     }
-  //     Serial.println("disabled.");
-  //     TMC_Driver.toff(0);
-  //     speed = 0;
-  //   }
-  //   else if (read_byte == '1') // Enable motor
-  //   {
-  //     Serial.print("Motor ");
-  //     if (TMC_Driver.toff() != 0)
-  //     {
-  //       Serial.print("already ");
-  //     }
-  //     Serial.println("enabled.");
-  //     TMC_Driver.toff(TOFF_VALUE);
-  //   }
-  //   else if (read_byte == '+') // Increase speed
-  //   {
-  //     speed += 1000;
-  //     if (speed == 0)
-  //     {
-  //       Serial.println("Hold motor.");
-  //     }
-  //     else
-  //     {
-  //       Serial.println("Increase speed.");
-  //     }
-  //     TMC_Driver.VACTUAL(speed);
-  //   }
-  //   else if (read_byte == '-') // Decrease speed
-  //   {
-  //     speed -= 1000;
-  //     if (speed == 0)
-  //     {
-  //       Serial.println("Hold motor.");
-  //     }
-  //     else
-  //     {
-  //       Serial.println("Decrease speed.");
-  //     }
-  //     TMC_Driver.VACTUAL(speed);
-  //   }
-  // }
+  if (potVal <= 500) // In lower half of range turn counter clockwise
+  {                  // (direction depends on motor wiring?)
+    speed = map(potVal, 0, 500, -200000, 0);
+  }
+  else if (potVal >= 520) // In high half of range turn clockwise
+  {
+    speed = map(potVal, 520, 1023, 0, 200000);
+  }
+  else // Create a "dead zone" between CW and CCW
+  {    // if 500 < potVal < 520
+    speed = 0;
+  }
 
-  // // Read joystick and control motor speed (COMMENTED OUT)
-  // int potVal = analogRead(A0); // Read potentiometer (0-1023)
-
-  // if (potVal <= 500) // In lower half of range turn counter clockwise
-  // {                  // (direction depends on motor wiring?)
-  //   speed = map(potVal, 0, 500, -200000, 0);
-  // }
-  // else if (potVal >= 520) // In high half of range turn clockwise
-  // {
-  //   speed = map(potVal, 520, 1023, 0, 200000);
-  // }
-  // else // Create a "dead zone" between CW and CCW
-  // {    // if 500 < potVal < 520
-  //   speed = 0;
-  // }
-
-  // // Apply speed to motor (COMMENTED OUT)
-  // TMC_Driver.VACTUAL(speed);
+  // Apply speed to motor
+  TMC_Driver.VACTUAL(speed);
 
   // Print StallGuard results every 100ms
-  // if ((ms - last_time) > 100)
-  // {
-  //   last_time = ms;
+  if ((ms - last_time) > 100)
+  {
+    last_time = ms;
 
-  //   // Only print full status when motor is enabled and moving
-  //   // if (TMC_Driver.toff() != 0 && speed != 0)
-  //   // {
-  //   Serial.print("Status: SG=");
-  //   Serial.print(TMC_Driver.SG_RESULT(), DEC);
-  //   Serial.print(" STALL=");
-  //   Serial.print(TMC_Driver.SG_RESULT() < STALL_VALUE ? 1 : 0);
-  //   Serial.print(" DIAG=");
-  //   Serial.print(diagPin, DEC);
-  //   Serial.print(" I=");
-  //   Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
-  //   Serial.println("mA");
-  //   // }
-  // } // end print every 100ms
+    // Only print full status when motor is enabled and moving
+    if (TMC_Driver.toff() != 0 && speed != 0)
+    {
+      Serial.print("Status: SG=");
+      Serial.print(TMC_Driver.SG_RESULT(), DEC);
+      Serial.print(" STALL=");
+      Serial.print(TMC_Driver.SG_RESULT() < STALL_VALUE, DEC);
+      Serial.print(" DIAG=");
+      Serial.print(diagPin, DEC);
+      Serial.print(" I=");
+      Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
+      Serial.println("mA");
+    }
+    else
+    {
+      // Always report DIAG pin even when not moving
+      Serial.print("DIAG=");
+      Serial.println(diagPin, DEC);
+    }
+  }
+
 } // end loop
+
 // void setup()
 // {
 //   Serial.begin(9600);
