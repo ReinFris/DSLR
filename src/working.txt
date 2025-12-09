@@ -142,7 +142,7 @@ void loop()
     static uint32_t last_diag_check = 0;
 
     // Print status during homing every 100ms (BEFORE checking for stall)
-    if ((ms - last_diag_check) > 10)
+    if ((ms - last_diag_check) > 100)
     {
       last_diag_check = ms;
 
@@ -159,8 +159,6 @@ void loop()
       Serial.print(diagPin);
       Serial.print(" SG=");
       Serial.print(TMC_Driver.SG_RESULT(), DEC);
-      Serial.print(" MSCNT=");
-      Serial.print(TMC_Driver.MSCNT());
       Serial.print(" I=");
       Serial.print(TMC_Driver.cs2rms(TMC_Driver.cs_actual()), DEC);
       Serial.println("mA");
@@ -173,8 +171,6 @@ void loop()
 
       Serial.print("SG_RESULT: ");
       Serial.println(TMC_Driver.SG_RESULT());
-      Serial.print("MSCNT: ");
-      Serial.println(TMC_Driver.MSCNT());
 
       // Stall detected via interrupt!
       if (startupState == STARTUP_MOVING_FIRST_SIDE)
