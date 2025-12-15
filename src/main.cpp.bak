@@ -103,7 +103,7 @@
 // Motor parameters
 #define STEPS_PER_REV 200 // Standard stepper motor (1.8° per step)
 #define MICROSTEPS 256    // Microsteps setting for TMC2209
-#define STEP_DELAY 160    // Microseconds between steps (for homing)
+#define STEP_DELAY 1000   // Microseconds between steps (for standalone mode)
 
 // TMC2209 Configuration
 #define R_SENSE 0.11f       // SilentStepStick series use 0.11 Ohm
@@ -111,9 +111,7 @@
 #define RUN_CURRENT 800     // Motor current in mA (adjust for your motor)
 #define STALL_VALUE 10      // StallGuard threshold [0..255] (lower = more sensitive)
 #define TOFF_VALUE 5        // Off time setting [1..15]
-
-// Movement parameters
-#define HOMING_BACKOFF_STEPS 5000 // Steps to back off after hitting stall
+#define HOMING_SPEED 16000  // Speed for homing sequence (VACTUAL units)
 
 // ============================================================================
 // GLOBAL OBJECTS
@@ -129,12 +127,20 @@ TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
 EncoderReader encoder;
 
 // ============================================================================
-// GLOBAL VARIABLES
+// HOMING STATE MACHINE
 // ============================================================================
 
+enum HomingState
+{
+  HOMING_NOT_STARTED,
+  HOMING_FIRST_SIDE,
+  HOMING_SECOND_SIDE,
+  HOMING_BACKOFF,
+  HOMING_COMPLETE
+};
+
+HomingState homingState = HOMING_NOT_STARTED;
 volatile bool stallDetected = false; // Flag set by interrupt
-bool shaftVal = false;               // Direction: false = forward, true = reverse
-bool startup = true;                 // Run homing on startup
 
 // Update interval for serial output (milliseconds)
 const unsigned long PRINT_INTERVAL = 100; // 10Hz update rate
@@ -148,72 +154,6 @@ unsigned long lastPrintTime = 0;
 void stallInterruptHandler()
 {
   stallDetected = true;
-}
-
-// ============================================================================
-// MOTOR CONTROL FUNCTIONS
-// ============================================================================
-
-// Generate step pulses for motor movement
-void motor(int steps, int stepDelay)
-{
-  digitalWrite(ENABLE_PIN, LOW);   // Ensure driver is enabled
-  digitalWrite(DIR_PIN, shaftVal); // Set direction via hardware pin
-
-  for (int i = 0; i < steps; i++)
-  {
-    digitalWrite(STEP_PIN, HIGH);
-    delayMicroseconds(stepDelay);
-    digitalWrite(STEP_PIN, LOW);
-    delayMicroseconds(stepDelay);
-
-    // Check for stall during movement
-    if (stallDetected)
-    {
-      break;
-    }
-  }
-}
-
-// Homing routine - uses StallGuard to find limits
-void homeX()
-{
-  const int homeDelay = STEP_DELAY;
-  const int backSteps = HOMING_BACKOFF_STEPS;
-
-  Serial.println(F("Fast homing X"));
-  shaftVal = true;
-
-  // Fast approach to first side
-  while (!stallDetected)
-  {
-    motor(1000, homeDelay);
-  }
-
-  stallDetected = false;
-  delay(1000);
-
-  Serial.println(F("Backing off"));
-  shaftVal = false;
-  motor(backSteps, homeDelay);
-
-  Serial.println(F("Slow homing X"));
-  shaftVal = true;
-
-  // Slow precise homing
-  while (!stallDetected)
-  {
-    motor(1000, homeDelay * 2);
-  }
-
-  stallDetected = false;
-  delay(1000);
-
-  Serial.println(F("Final backoff"));
-  shaftVal = false;
-  motor(backSteps, homeDelay);
-
-  Serial.println(F("[Home] DONE!"));
 }
 
 // ============================================================================
@@ -266,11 +206,8 @@ void setup()
   // Configure TMC2209
   TMC_Driver.begin();
   TMC_Driver.toff(TOFF_VALUE);
-  TMC_Driver.blank_time(24);
   TMC_Driver.rms_current(RUN_CURRENT);
   TMC_Driver.microsteps(MICROSTEPS);
-
-  // StealthChop configuration
   TMC_Driver.en_spreadCycle(false);
   TMC_Driver.pwm_autoscale(true);
 
@@ -338,8 +275,12 @@ void setup()
   else
     Serial.println(F("[AS5600] Not found"));
 
-  Serial.println(F("\n--- Ready ---"));
-  Serial.println(F("Homing on startup..."));
+  // Start sensorless homing
+  Serial.println(F("\n--- HOMING ---"));
+  Serial.println(F("Moving to 1st..."));
+
+  TMC_Driver.VACTUAL(HOMING_SPEED); // Start moving
+  homingState = HOMING_FIRST_SIDE;
 }
 
 // ============================================================================
@@ -351,109 +292,116 @@ void loop()
   // Update encoder state (detects zero crossings)
   encoder.update();
 
-  // ============================================================================
-  // STARTUP HOMING
-  // ============================================================================
-
-  if (startup)
-  {
-    startup = false;
-    homeX();
-  }
-
-  // ============================================================================
-  // STALL DETECTION DURING MOVEMENT
-  // ============================================================================
-
-  if (stallDetected)
-  {
-    const int backSteps = 1000;
-    Serial.println(F("Stalled"));
-
-    stallDetected = false;
-    shaftVal = !shaftVal; // Reverse direction
-    motor(backSteps, STEP_DELAY);
-  }
-
-  // ============================================================================
-  // SERIAL COMMANDS
-  // ============================================================================
-
-  if (Serial.available() > 0)
-  {
-    char readVal = Serial.read();
-
-    // Move X steps: "x1000" or "x-1000"
-    if (readVal == 'x')
-    {
-      int steps = Serial.parseInt();
-
-      if (steps < 0)
-      {
-        shaftVal = true;
-        steps *= -1;
-      }
-      else
-      {
-        shaftVal = false;
-      }
-
-      motor(steps, STEP_DELAY);
-    }
-
-    // Home command: "h"
-    if (readVal == 'h')
-    {
-      homeX();
-    }
-  }
-
-  // ============================================================================
-  // ENCODER STATUS OUTPUT
-  // ============================================================================
-
   unsigned long currentTime = millis();
-  if (currentTime - lastPrintTime >= PRINT_INTERVAL)
+  static unsigned long backoffStartTime = 0;
+
+  // ============================================================================
+  // SENSORLESS HOMING STATE MACHINE
+  // ============================================================================
+
+  if (homingState != HOMING_COMPLETE)
   {
-    lastPrintTime = currentTime;
+    // Check for stall detection
+    if (stallDetected)
+    {
+      stallDetected = false; // Clear flag
 
-    // Get encoder readings
-    uint16_t rawAngle = encoder.getRawAngle();
-    float degrees = encoder.getDegrees();
-    long rotations = encoder.getRotationCount();
+      if (homingState == HOMING_FIRST_SIDE)
+      {
+        Serial.print(F("[Home] STALL SG="));
+        Serial.println(TMC_Driver.SG_RESULT());
+        Serial.println(F("Rev to 2nd..."));
 
-    // Format and print data
-    int deg_int = (int)degrees;
-    int deg_frac = (int)((degrees - deg_int) * 100);
+        TMC_Driver.VACTUAL(-HOMING_SPEED);
+        homingState = HOMING_SECOND_SIDE;
+      }
+      else if (homingState == HOMING_SECOND_SIDE)
+      {
+        Serial.print(F("[Home] STALL SG="));
+        Serial.println(TMC_Driver.SG_RESULT());
+        Serial.println(F("Backoff 2s..."));
 
-    Serial.print(rawAngle);
-    Serial.print(F("|"));
-    Serial.print(deg_int);
-    Serial.print(F("."));
-    Serial.print(deg_frac);
-    Serial.print(F("|"));
-    Serial.print(rotations);
-    Serial.print(F("|"));
+        TMC_Driver.VACTUAL(HOMING_SPEED);
+        backoffStartTime = currentTime;
+        homingState = HOMING_BACKOFF;
+      }
+    }
 
-    // Magnet status
-    if (!encoder.detectMagnet())
-      Serial.print(F("N"));
-    else if (encoder.magnetTooStrong())
-      Serial.print(F("S"));
-    else if (encoder.magnetTooWeak())
-      Serial.print(F("W"));
-    else
-      Serial.print(F("O"));
+    // Handle backoff timing
+    if (homingState == HOMING_BACKOFF)
+    {
+      if ((currentTime - backoffStartTime) >= 2000)
+      {
+        TMC_Driver.VACTUAL(0);
+        homingState = HOMING_COMPLETE;
+        Serial.println(F("[Home] DONE!"));
+        Serial.println(F("St|Raw|Deg|Rot|Mag|SG"));
+      }
+    }
 
-    Serial.print(F("|"));
-    Serial.println(TMC_Driver.SG_RESULT());
+    // Print status during homing
+    static unsigned long lastHomingPrint = 0;
+    if ((currentTime - lastHomingPrint) >= 100)
+    {
+      lastHomingPrint = currentTime;
+
+      Serial.print(F("SG="));
+      Serial.print(TMC_Driver.SG_RESULT());
+      Serial.print(F(" D="));
+      Serial.print(digitalRead(DIAG_PIN));
+      Serial.print(F(" I="));
+      Serial.println(TMC_Driver.cs2rms(TMC_Driver.cs_actual()));
+    }
   }
-
-  // Blink LED to show we're running
-  static unsigned long lastBlink = 0;
-  if (currentTime - lastBlink >= 1000)
+  else
   {
-    lastBlink = currentTime;
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    // ============================================================================
+    // NORMAL OPERATION - After homing complete
+    // ============================================================================
+
+    // Print encoder and motor status
+    if (currentTime - lastPrintTime >= PRINT_INTERVAL)
+    {
+      lastPrintTime = currentTime;
+
+      // Get encoder readings
+      uint16_t rawAngle = encoder.getRawAngle();
+      float degrees = encoder.getDegrees();
+      long rotations = encoder.getRotationCount();
+
+      // Format and print data
+      int deg_int = (int)degrees;
+      int deg_frac = (int)((degrees - deg_int) * 100);
+
+      Serial.print(rawAngle);
+      Serial.print(F("|"));
+      Serial.print(deg_int);
+      Serial.print(F("."));
+      Serial.print(deg_frac);
+      Serial.print(F("|"));
+      Serial.print(rotations);
+      Serial.print(F("|"));
+
+      // Magnet status
+      if (!encoder.detectMagnet())
+        Serial.print(F("N"));
+      else if (encoder.magnetTooStrong())
+        Serial.print(F("S"));
+      else if (encoder.magnetTooWeak())
+        Serial.print(F("W"));
+      else
+        Serial.print(F("O"));
+
+      Serial.print(F("|"));
+      Serial.println(TMC_Driver.SG_RESULT());
+    }
+
+    // Blink LED to show we're in normal operation
+    static unsigned long lastBlink = 0;
+    if (currentTime - lastBlink >= 1000)
+    {
+      lastBlink = currentTime;
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
   }
 }
