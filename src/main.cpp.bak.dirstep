@@ -71,7 +71,6 @@
 #include <Wire.h>
 #include <TMCStepper.h>
 #include <SoftwareSerial.h>
-#include <AccelStepper.h>
 #include "EncoderReader.h"
 
 // ============================================================================
@@ -103,21 +102,15 @@
 
 // Motor parameters
 #define STEPS_PER_REV 200 // Standard stepper motor (1.8° per step)
-#define MICROSTEPS 2      // Microsteps setting for TMC2209
+#define MICROSTEPS 16     // Microsteps setting for TMC2209
 #define STEP_DELAY 100    // Microseconds between steps (for homing) 700?
 
 // TMC2209 Configuration
 #define R_SENSE 0.11f       // SilentStepStick series use 0.11 Ohm
 #define DRIVER_ADDRESS 0b00 // TMC2209 Driver address (MS1 and MS2 to GND)
 #define RUN_CURRENT 500     // Motor current in mA (adjust for your motor)
-#define STALL_VALUE 24      // StallGuard threshold [0..255] (lower = more sensitive)
+#define STALL_VALUE 48      // StallGuard threshold [0..255] (lower = more sensitive)
 #define TOFF_VALUE 4        // Off time setting [1..15]
-
-// AccelStepper Configuration
-#define MAX_SPEED 9000.0                         // Maximum speed in steps/second
-#define ACCELERATION 10000.0                     // Acceleration in steps/second^2
-#define DEFAULT_SPEED 1000.0                     // Default speed for moves
-#define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS) // Total steps per revolution
 
 // Movement parameters
 #define HOMING_BACKOFF_STEPS 500 // Steps to back off after hitting stall
@@ -132,10 +125,6 @@ SoftwareSerial SoftSerial(SW_RX, SW_TX);
 // Create TMC2209 driver object
 TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
 
-// Create AccelStepper object using DRIVER mode (step/direction interface)
-// AccelStepper stepper(interface, stepPin, directionPin)
-AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
-
 // Create encoder instance
 EncoderReader encoder;
 
@@ -146,14 +135,6 @@ EncoderReader encoder;
 volatile bool stallDetected = false; // Flag set by interrupt
 bool shaftVal = false;               // Direction: false = forward, true = reverse
 bool startup = true;                 // Run homing on startup
-
-// Homing limit positions
-long firstLimitPosition = 0;
-long secondLimitPosition = 0;
-long minLimit = 0;
-long maxLimit = 0;
-long centerPosition = 0;
-bool isHomed = false;
 
 // Update interval for serial output (milliseconds)
 const unsigned long PRINT_INTERVAL = 100; // 10Hz update rate
@@ -174,29 +155,7 @@ void stallInterruptHandler()
 // MOTOR CONTROL FUNCTIONS
 // ============================================================================
 
-// Move motor by relative steps (positive = forward, negative = backward)
-void moveRelative(long steps)
-{
-  stepper.move(steps);
-  Serial.print(F("Moving by "));
-  Serial.print(steps);
-  Serial.println(F(" steps"));
-}
-
-// Rotate motor by degrees (based on TOTAL_STEPS configuration)
-void rotateDegrees(float degrees)
-{
-  long steps = (long)((degrees / 360.0) * TOTAL_STEPS);
-  stepper.move(steps);
-  Serial.print(F("Rotating "));
-  Serial.print(degrees);
-  Serial.print(F("° ("));
-  Serial.print(steps);
-  Serial.println(F(" steps)"));
-}
-
-// Generate step pulses for motor movement (OLD - kept for homing compatibility)
-// Used during sensorless homing where blocking movement is needed
+// Generate step pulses for motor movement
 void motor(int steps, int stepDelay)
 {
   digitalWrite(ENABLE_PIN, LOW);   // Ensure driver is enabled
@@ -217,136 +176,197 @@ void motor(int steps, int stepDelay)
   }
 }
 
-// Helper function: Move until stall is detected (used for finding limits)
-// Returns the position where stall was detected
-// ignoreSteps: number of steps to move before checking for stall (to clear "hot" stall signal)
-long moveUntilStall(float speed, const char *stepLabel, long ignoreSteps = 0)
-{
-  Serial.print(F("\n["));
-  Serial.print(stepLabel);
-  Serial.println(F("] Finding limit..."));
+// void motor(int steps, int stepDelay)
+// {
+//   static bool initialized = false;
+//   static int stepsRemaining = 0;
+//   static bool stepState = LOW;
+//   static unsigned long lastStepTime = 0;
+//   static unsigned long stepIntervalMs = 0;
 
-  stepper.setSpeed(speed);
-  long startPosition = stepper.currentPosition();
+//   if (!initialized)
+//   {
+//     digitalWrite(ENABLE_PIN, LOW);
+//     digitalWrite(DIR_PIN, shaftVal);
 
-  // Clear any pending stall flag
-  stallDetected = false;
+//     stepsRemaining = steps;
+//     stepIntervalMs = stepDelay / 1000; // micros → millis
+//     if (stepIntervalMs == 0)
+//       stepIntervalMs = 1;
 
-  while (!stallDetected)
-  {
-    stepper.runSpeed();
-    encoder.update();
+//     stepState = LOW;
+//     digitalWrite(STEP_PIN, LOW);
 
-    // Ignore stall detection for the first ignoreSteps
-    if (abs(stepper.currentPosition() - startPosition) < ignoreSteps)
-    {
-      stallDetected = false; // Keep clearing the flag during ignore period
-    }
+//     lastStepTime = millis();
+//     initialized = true;
+//   }
 
-    // Serial printing disabled during movement to prevent stuttering
-    // Printing blocks execution and interrupts smooth stepper pulses
-  }
+//   if (stepsRemaining <= 0 || stallDetected)
+//   {
+//     initialized = false; // reset for next call
+//     return;
+//   }
 
-  long stallPosition = stepper.currentPosition();
-  Serial.print(F("["));
-  Serial.print(stepLabel);
-  Serial.print(F("] Limit found at position: "));
-  Serial.println(stallPosition);
+//   unsigned long now = millis();
 
-  stepper.setSpeed(0);
-  delay(100);
+//   if (now - lastStepTime >= stepIntervalMs)
+//   {
+//     lastStepTime = now;
 
-  return stallPosition;
-}
+//     stepState = !stepState;
+//     digitalWrite(STEP_PIN, stepState);
 
-// Helper function: Move to target position and print progress
-void moveToPosition(long targetPosition, float speed, unsigned long printInterval)
-{
-  long stepsToMove = targetPosition - stepper.currentPosition();
-  float moveSpeed = (stepsToMove > 0) ? speed : -speed;
-  stepper.setSpeed(moveSpeed);
+//     // Count only completed pulses
+//     if (stepState == LOW)
+//     {
+//       stepsRemaining--;
+//     }
+//   }
+// }
 
-  while ((stepsToMove > 0) ? (stepper.currentPosition() < targetPosition) : (stepper.currentPosition() > targetPosition))
-  {
-    stepper.runSpeed();
-    encoder.update();
-
-    // Serial printing disabled during movement to prevent stuttering
-  }
-
-  stepper.setSpeed(0);
-}
-
-// Homing routine - uses StallGuard to find limits on both ends, then returns to center
-// Uses runSpeed() for constant speed movement with no acceleration (5000 microsteps/s)
+// Homing routine - uses StallGuard to find limits
 void homeX()
 {
-  const float HOMING_SPEED = 800.0; // works OK with #define MICROSTEPS 2
+  const int homeDelay = STEP_DELAY;
 
-  Serial.println(F("\n=== HOMING SEQUENCE START ==="));
-  Serial.print(F("Homing speed: "));
-  Serial.print(HOMING_SPEED);
-  Serial.println(F(" microsteps/s (~312 full steps/s)"));
+  Serial.println(F("Homing X"));
+  shaftVal = true;
 
+  // Clear any initial stall flag (motor not moving yet)
   stallDetected = false;
   delay(100);
 
-  Serial.println(F("[Home] Attaching interrupt..."));
+  // Check DIAG before starting movement
+  Serial.print(F("[Home] DIAG before move="));
+  Serial.println(digitalRead(DIAG_PIN));
+
+  // Start motor movement to initialize StallGuard
+  motor(20, homeDelay); // Move a bit first
+  delay(50);
+
+  // NOW attach the interrupt after motor is moving
+  Serial.print(F("[Home] DIAG after startup move="));
+  Serial.println(digitalRead(DIAG_PIN));
+
+  // Clear flag before attaching interrupt
+  stallDetected = false;
   attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallInterruptHandler, RISING);
-  delay(10);
+  delay(10);             // Small delay for interrupt to stabilize
+  stallDetected = false; // Clear again in case of spurious trigger
+
+  Serial.println(F("[Home] Interrupt attached"));
+
+  // Fast approach to first side
+  int loopCount = 0;
+  while (!stallDetected)
+  {
+    motor(100, homeDelay);
+    loopCount++;
+
+    // Debug StallGuard values during homing
+    uint16_t sg_result = TMC_Driver.SG_RESULT();
+    uint8_t diag_state = digitalRead(DIAG_PIN);
+    Serial.print(F("[Home] Loop="));
+    Serial.print(loopCount);
+    Serial.print(F(" SG="));
+    Serial.print(sg_result);
+    Serial.print(F(" DIAG="));
+    Serial.println(diag_state);
+  }
+
+  Serial.print(F("[Home] Loops before stall: "));
+  Serial.println(loopCount);
+
+  // Stall detected - print final values
+  uint16_t sg_result = TMC_Driver.SG_RESULT();
+  Serial.print(F("[Home] STALL! SG="));
+  Serial.print(sg_result);
+  Serial.print(F(" DIAG="));
+  Serial.println(digitalRead(DIAG_PIN));
+
+  stallDetected = false;
+  delay(1000);
+
+  // Back off from the stall position
+  Serial.println(F("[Home] Backing off..."));
+  shaftVal = !shaftVal; // Reverse direction
+  motor(HOMING_BACKOFF_STEPS, homeDelay);
+  // shaftVal = !shaftVal; // Reverse direction
+  delay(1000);
   stallDetected = false;
 
-  // STEP 1: Find first limit (negative direction)
-  moveUntilStall(-HOMING_SPEED, "Step 1");
+  // Second slower homing pass for precision
+  Serial.println(F("[Home] Second pass (slower)..."));
+  shaftVal = !shaftVal;                    // Back to original direction
+  const int slowHomeDelay = homeDelay + 1; // Slower speed for precision
 
-  firstLimitPosition = 0;
-  stepper.setCurrentPosition(0);
-  Serial.print(F("[Step 1] First limit set at position: "));
-  Serial.println(firstLimitPosition);
+  loopCount = 0;
+  while (!stallDetected)
+  {
+    motor(100, slowHomeDelay); // Smaller steps, slower speed
+    loopCount++;
 
-  // STEP 2: Find second limit (positive direction)
-  // Ignore first 100 steps to clear "hot" stall signal from Step 1
-  moveUntilStall(HOMING_SPEED, "Step 2", 100);
+    // uint16_t sg_result = TMC_Driver.SG_RESULT();
+    // uint8_t diag_state = digitalRead(DIAG_PIN);
+    // Serial.print(F("[Home2] Loop="));
+    // Serial.print(loopCount);
+    // Serial.print(F(" SG="));
+    // Serial.print(sg_result);
+    // Serial.print(F(" DIAG="));
+    // Serial.println(diag_state);
+  }
+  delay(500);
 
-  secondLimitPosition = stepper.currentPosition();
+  // Serial.print(F("[Home2] STALL! SG="));
+  // Serial.print(TMC_Driver.SG_RESULT());
+  // Serial.print(F(" DIAG="));
+  // Serial.println(digitalRead(DIAG_PIN));
 
-  // Calculate limits and center
-  minLimit = (firstLimitPosition < secondLimitPosition) ? firstLimitPosition : secondLimitPosition;
-  maxLimit = (firstLimitPosition < secondLimitPosition) ? secondLimitPosition : firstLimitPosition;
-  centerPosition = (minLimit + maxLimit) / 2;
+  // stallDetected = false;
+  // delay(500);
 
-  Serial.println(F("\n=== HOMING RESULTS ==="));
-  Serial.print(F("First limit:  "));
-  Serial.println(firstLimitPosition);
-  Serial.print(F("Second limit: "));
-  Serial.println(secondLimitPosition);
-  Serial.print(F("Min limit:    "));
-  Serial.println(minLimit);
-  Serial.print(F("Max limit:    "));
-  Serial.println(maxLimit);
-  Serial.print(F("Range:        "));
-  Serial.print(maxLimit - minLimit);
-  Serial.println(F(" steps"));
-  Serial.print(F("Center:       "));
-  Serial.println(centerPosition);
+  // // Back off again
+  // Serial.println(F("[Home] Backing off from second pass..."));
+  // shaftVal = !shaftVal;
+  // motor(HOMING_BACKOFF_STEPS, homeDelay);
+  // delay(200);
+  // stallDetected = false;
 
-  detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
-  Serial.println(F("[Home] Interrupt detached"));
+  // // Home in opposite direction (slow)
+  // Serial.println(F("[Home] Homing opposite direction (slow)..."));
+  // // shaftVal already reversed from backoff
 
-  // STEP 3: Move to center position
-  Serial.println(F("\n[Step 3] Moving to center position..."));
-  Serial.print(F("Current position: "));
-  Serial.println(stepper.currentPosition());
-  Serial.print(F("Steps to center:  "));
-  Serial.println(centerPosition - stepper.currentPosition());
+  // loopCount = 0;
+  // while (!stallDetected)
+  // {
+  //   motor(500, slowHomeDelay);
+  //   loopCount++;
 
-  moveToPosition(centerPosition, HOMING_SPEED, 500);
+  //   uint16_t sg_result = TMC_Driver.SG_RESULT();
+  //   uint8_t diag_state = digitalRead(DIAG_PIN);
+  //   Serial.print(F("[Home3] Loop="));
+  //   Serial.print(loopCount);
+  //   Serial.print(F(" SG="));
+  //   Serial.print(sg_result);
+  //   Serial.print(F(" DIAG="));
+  //   Serial.println(diag_state);
+  // }
 
-  Serial.print(F("[Step 3] Arrived at center! Position="));
-  Serial.println(stepper.currentPosition());
+  // Serial.print(F("[Home3] STALL! SG="));
+  // Serial.print(TMC_Driver.SG_RESULT());
+  // Serial.print(F(" DIAG="));
+  // Serial.println(digitalRead(DIAG_PIN));
 
-  isHomed = true;
-  Serial.println(F("\n=== HOMING COMPLETE ===\n"));
+  // stallDetected = false;
+  // delay(500);
+
+  // // Final back off from opposite end
+  // Serial.println(F("[Home] Final backoff..."));
+  // shaftVal = !shaftVal;
+  // motor(HOMING_BACKOFF_STEPS, homeDelay);
+  // delay(200);
+
+  Serial.println(F("[Home] DONE!"));
 }
 
 // ============================================================================
@@ -376,17 +396,6 @@ void setup()
   // IMPORTANT: Enable driver in hardware BEFORE UART communication
   digitalWrite(ENABLE_PIN, LOW); // Enable driver (active LOW)
   Serial.println(F("[HW] Driver ON"));
-
-  // Initialize AccelStepper
-  stepper.setMaxSpeed(1000 * MAX_SPEED);
-  stepper.setAcceleration(1000 * ACCELERATION);
-  stepper.setCurrentPosition(0); // Set current position as zero
-  Serial.print(F("[ACCEL] MaxSpd="));
-  Serial.print(MAX_SPEED);
-  Serial.print(F(" Accel="));
-  Serial.print(ACCELERATION);
-  Serial.print(F(" Steps/rev="));
-  Serial.println(TOTAL_STEPS);
 
   // Check initial DIAG pin state
   Serial.print(F("[HW] DIAG initial="));
@@ -505,19 +514,130 @@ void setup()
 
 void loop()
 {
-  if (startup)
-  {
-    startup = false;
-    homeX();
-  }
-  // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
-  // This handles acceleration, deceleration, and stepping
-  stepper.run();
-
   // Update encoder state (detects zero crossings)
   encoder.update();
 
   // ============================================================================
   // STARTUP HOMING
   // ============================================================================
+
+  if (startup)
+  {
+    startup = false;
+    homeX();
+  }
+
+  // ============================================================================
+  // STALL DETECTION DURING MOVEMENT
+  // ============================================================================
+
+  // if (stallDetected)
+  // {
+  //   const int backSteps = 1000;
+
+  //   // Debug: Print StallGuard values when stall is detected
+  //   uint16_t sg_result = TMC_Driver.SG_RESULT();
+  //   uint8_t diag_state = digitalRead(DIAG_PIN);
+  //   uint32_t drv_status = TMC_Driver.DRV_STATUS();
+
+  //   Serial.println(F("Stalled"));
+  //   Serial.print(F("  SG_RESULT="));
+  //   Serial.println(sg_result);
+  //   Serial.print(F("  DIAG_PIN="));
+  //   Serial.println(diag_state);
+  //   Serial.print(F("  DRV_STATUS=0x"));
+  //   Serial.println(drv_status, HEX);
+
+  //   stallDetected = false;
+  //   shaftVal = !shaftVal; // Reverse direction
+  //   motor(backSteps, STEP_DELAY);
+  // }
+
+  // // ============================================================================
+  // // SERIAL COMMANDS
+  // // ============================================================================
+
+  // if (Serial.available() > 0)
+  // {
+  //   char readVal = Serial.read();
+
+  //   // Move X steps: "x1000" or "x-1000"
+  //   if (readVal == 'x')
+  //   {
+  //     int steps = Serial.parseInt();
+
+  //     if (steps < 0)
+  //     {
+  //       shaftVal = true;
+  //       steps *= -1;
+  //     }
+  //     else
+  //     {
+  //       shaftVal = false;
+  //     }
+
+  //     motor(steps, STEP_DELAY);
+  //   }
+
+  //   // Home command: "h"
+  //   if (readVal == 'h')
+  //   {
+  //     homeX();
+  //   }
+  // }
+
+  // // ============================================================================
+  // // ENCODER STATUS OUTPUT
+  // // ============================================================================
+
+  // unsigned long currentTime = millis();
+  // if (currentTime - lastPrintTime >= PRINT_INTERVAL)
+  // {
+  //   lastPrintTime = currentTime;
+
+  //   // Get encoder readings
+  //   uint16_t rawAngle = encoder.getRawAngle();
+  //   float degrees = encoder.getDegrees();
+  //   long rotations = encoder.getRotationCount();
+
+  //   // Format and print data
+  //   int deg_int = (int)degrees;
+  //   int deg_frac = (int)((degrees - deg_int) * 100);
+
+  //   Serial.print(rawAngle);
+  //   Serial.print(F("|"));
+  //   Serial.print(deg_int);
+  //   Serial.print(F("."));
+  //   Serial.print(deg_frac);
+  //   Serial.print(F("|"));
+  //   Serial.print(rotations);
+  //   Serial.print(F("|"));
+
+  //   // Magnet status
+  //   if (!encoder.detectMagnet())
+  //     Serial.print(F("N"));
+  //   else if (encoder.magnetTooStrong())
+  //     Serial.print(F("S"));
+  //   else if (encoder.magnetTooWeak())
+  //     Serial.print(F("W"));
+  //   else
+  //     Serial.print(F("O"));
+
+  //   // StallGuard debug info
+  //   uint16_t sg_result = TMC_Driver.SG_RESULT();
+  //   uint8_t diag_state = digitalRead(DIAG_PIN);
+
+  //   Serial.print(F("|SG="));
+  //   Serial.print(sg_result);
+  //   Serial.print(F("|DIAG="));
+  //   Serial.println(diag_state);
+  // }
+
+  // // Blink LED to show we're running
+  // static unsigned long lastBlink = 0;
+  // if (currentTime - lastBlink >= 1000)
+  // {
+  //   lastBlink = currentTime;
+  //   digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  // }
 }
