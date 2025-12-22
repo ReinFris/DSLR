@@ -333,17 +333,37 @@ void homeX()
   detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
   Serial.println(F("[Home] Interrupt detached"));
 
-  // STEP 3: Move to center position
-  Serial.println(F("\n[Step 3] Moving to center position..."));
+  // STEP 3: Move to center position using full AccelStepper capabilities
+  Serial.println(F("\n[Step 3] Moving to center with acceleration..."));
   Serial.print(F("Current position: "));
   Serial.println(stepper.currentPosition());
+  Serial.print(F("Target position:  "));
+  Serial.println(centerPosition);
   Serial.print(F("Steps to center:  "));
   Serial.println(centerPosition - stepper.currentPosition());
+  Serial.print(F("Max speed:        "));
+  Serial.print(stepper.maxSpeed());
+  Serial.println(F(" steps/s"));
+  Serial.print(F("Acceleration:     "));
+  Serial.print(stepper.acceleration());
+  Serial.println(F(" steps/s²"));
 
-  moveToPosition(centerPosition, HOMING_SPEED, 500);
+  // Use moveTo() for accelerated movement to center
+  stepper.moveTo(centerPosition);
+
+  // Run motor with acceleration until target is reached
+  // NO Serial.print() here - blocking I/O causes stuttering!
+  while (stepper.distanceToGo() != 0)
+  {
+    stepper.run();
+    encoder.update();
+  }
 
   Serial.print(F("[Step 3] Arrived at center! Position="));
   Serial.println(stepper.currentPosition());
+  Serial.print(F("Final speed: "));
+  Serial.print(stepper.speed());
+  Serial.println(F(" steps/s"));
 
   isHomed = true;
   Serial.println(F("\n=== HOMING COMPLETE ===\n"));
@@ -378,13 +398,14 @@ void setup()
   Serial.println(F("[HW] Driver ON"));
 
   // Initialize AccelStepper
-  stepper.setMaxSpeed(1000 * MAX_SPEED);
-  stepper.setAcceleration(1000 * ACCELERATION);
-  stepper.setCurrentPosition(0); // Set current position as zero
+  // Using safe, reliable speeds per AccelStepper manual (max 1000 steps/s)
+  stepper.setMaxSpeed(1000.0);      // Safe reliable speed (per manual)
+  stepper.setAcceleration(2000.0);   // Conservative acceleration (2x speed)
+  stepper.setCurrentPosition(0);     // Set current position as zero
   Serial.print(F("[ACCEL] MaxSpd="));
-  Serial.print(MAX_SPEED);
+  Serial.print(stepper.maxSpeed());
   Serial.print(F(" Accel="));
-  Serial.print(ACCELERATION);
+  Serial.print(stepper.acceleration());
   Serial.print(F(" Steps/rev="));
   Serial.println(TOTAL_STEPS);
 
