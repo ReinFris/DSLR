@@ -19,6 +19,13 @@
 // DATA STRUCTURES
 // ============================================================================
 
+// Playback mode enumeration
+enum PlaybackMode
+{
+  PLAYBACK_BY_POSITION,      // Play markers sorted by physical position
+  PLAYBACK_BY_SELECTION_ORDER // Play markers in the order they were saved
+};
+
 // Position marker (encoder readings)
 struct PositionMarker
 {
@@ -56,7 +63,7 @@ class MarkerSystem
 {
 public:
   // Constants
-  static const uint8_t MAX_MARKERS = 3;
+  static const uint8_t MAX_MARKERS = 10;
   static const unsigned long DEBOUNCE_DELAY = 50;
   static const unsigned long LONG_PRESS_TIME = 2000;
   static const unsigned long SHORT_PRESS_MAX = 500;
@@ -83,6 +90,11 @@ public:
   void initializePlayback();
   PlaybackState &getPlaybackState() { return _playback; }
 
+  // Playback mode management
+  void setPlaybackMode(PlaybackMode mode) { _playbackMode = mode; }
+  PlaybackMode getPlaybackMode() const { return _playbackMode; }
+  void togglePlaybackMode();
+
   // State accessors
   const ButtonState &getButtonState() const { return _button; }
 
@@ -101,6 +113,9 @@ private:
 
   // Playback state
   PlaybackState _playback;
+
+  // Playback mode
+  PlaybackMode _playbackMode;
 
   // Helper functions
   long determineStartPosition();

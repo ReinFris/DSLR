@@ -149,7 +149,7 @@ void setup()
   Serial.println(F("[HW] Driver ON"));
 
   // Initialize AccelStepper
-  stepper.setMaxSpeed(1000.0);     // Safe reliable speed (per manual)
+  stepper.setMaxSpeed(2000.0);     // Safe reliable speed (per manual)
   stepper.setAcceleration(2000.0); // Conservative acceleration (2x speed)
   stepper.setCurrentPosition(0);   // Set current position as zero
   Serial.print(F("[ACCEL] MaxSpd="));

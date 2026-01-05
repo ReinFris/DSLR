@@ -22,7 +22,8 @@ StateMachine::StateMachine(EncoderReader &encoder, MotorControl &motorControl,
 
 void StateMachine::begin()
 {
-  // Nothing to initialize here - starts in STATE_STARTUP
+  // Set playback mode to selection order
+  _markerSystem.setPlaybackMode(PLAYBACK_BY_SELECTION_ORDER);
 }
 
 // ============================================================================
@@ -159,11 +160,9 @@ void StateMachine::handlePlaybackDelayState()
 
   if (elapsed >= MarkerSystem::PLAYBACK_DELAY_MS)
   {
-    // Verify we have exactly 3 markers
-    if (_markerSystem.getMarkerCount() != MarkerSystem::MAX_MARKERS) {
-      Serial.print(F("[Error] Need exactly "));
-      Serial.print(MarkerSystem::MAX_MARKERS);
-      Serial.print(F(" markers. Currently have "));
+    // Verify we have at least 2 markers for playback
+    if (_markerSystem.getMarkerCount() < 2) {
+      Serial.print(F("[Error] Need at least 2 markers for playback. Currently have "));
       Serial.println(_markerSystem.getMarkerCount());
       _currentState = STATE_DISABLED;
       return;

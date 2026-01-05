@@ -9,7 +9,7 @@
 // ============================================================================
 
 MarkerSystem::MarkerSystem(EncoderReader &encoder, MotorControl &motorControl, AccelStepper &stepper)
-    : _encoder(encoder), _motorControl(motorControl), _stepper(stepper), _markerCount(0)
+    : _encoder(encoder), _motorControl(motorControl), _stepper(stepper), _markerCount(0), _playbackMode(PLAYBACK_BY_POSITION)
 {
   // Initialize button state
   _button.currentState = false;
@@ -93,7 +93,9 @@ bool MarkerSystem::saveMarker()
 {
   if (_markerCount >= MAX_MARKERS)
   {
-    Serial.println(F("[Marker] Already at max (3) markers!"));
+    Serial.print(F("[Marker] Already at max ("));
+    Serial.print(MAX_MARKERS);
+    Serial.println(F(") markers!"));
     return false;
   }
 
@@ -213,8 +215,26 @@ void MarkerSystem::sortMarkersByPosition()
 
 void MarkerSystem::initializePlayback()
 {
-  // Sort markers by position (ascending order)
-  sortMarkersByPosition();
+  // Sort markers based on playback mode
+  if (_playbackMode == PLAYBACK_BY_POSITION)
+  {
+    Serial.println(F("[Playback] Mode: BY POSITION"));
+    sortMarkersByPosition();
+  }
+  else
+  {
+    Serial.println(F("[Playback] Mode: BY SELECTION ORDER"));
+    // No sorting - keep markers in the order they were saved
+    Serial.println(F("[Playback] Markers will play in selection order:"));
+    for (uint8_t i = 0; i < _markerCount; i++)
+    {
+      long pos = _motorControl.encoderToStepperPosition(_markers[i].rotationCount, _markers[i].rawAngle);
+      Serial.print(F("  Marker "));
+      Serial.print(i + 1);
+      Serial.print(F(": "));
+      Serial.println(pos);
+    }
+  }
 
   _playback.currentMarkerIndex = 0;
   _playback.movingToStart = true; // Now means "moving to first marker"
@@ -228,4 +248,22 @@ void MarkerSystem::initializePlayback()
   Serial.print(F("[Playback] Moving to first marker at stepper pos: "));
   Serial.println(firstMarkerPos);
   _stepper.moveTo(firstMarkerPos);
+}
+
+// ============================================================================
+// PLAYBACK MODE MANAGEMENT
+// ============================================================================
+
+void MarkerSystem::togglePlaybackMode()
+{
+  if (_playbackMode == PLAYBACK_BY_POSITION)
+  {
+    _playbackMode = PLAYBACK_BY_SELECTION_ORDER;
+    Serial.println(F("[Mode] Playback: SELECTION ORDER"));
+  }
+  else
+  {
+    _playbackMode = PLAYBACK_BY_POSITION;
+    Serial.println(F("[Mode] Playback: BY POSITION"));
+  }
 }
