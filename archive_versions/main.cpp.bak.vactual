@@ -1,0 +1,407 @@
+/*
+ * TMC2209 Stepper Motor with AS5600 Encoder for Arduino Uno
+ *
+ * ============================================================================
+ * PIN DEFINITIONS - ARDUINO UNO
+ * ============================================================================
+ *
+ * TMC2209 Stepper Driver -> Arduino Uno
+ * ----------------------------------------
+ * STEP     -> Digital Pin 5
+ * DIR      -> Digital Pin 4
+ * EN       -> Digital Pin 6 (active LOW - pull LOW to enable driver)
+ * DIAG     -> Digital Pin 3 (StallGuard detection, INT1, interrupt-capable)
+ * PDN_UART -> Digital Pins 7 & 8 (see UART wiring below)
+ * VCC_IO   -> 5V (Arduino logic level)
+ * GND      -> GND
+ * VM       -> Motor power supply (4.75V - 29V, separate from Arduino)
+ * A1, A2, B1, B2 -> Stepper motor coils
+ *
+ * TMC2209 UART Communication (for sensorless homing)
+ * ---------------------------------------------------
+ * SW_RX    -> Digital Pin 7 (connect via 1kΩ resistor to PDN_UART)
+ * SW_TX    -> Digital Pin 8 (connect directly to PDN_UART)
+ * NOTE: A 1kΩ resistor MUST be placed between SW_RX (pin 7) and PDN_UART
+ *       SW_TX (pin 8) connects directly to PDN_UART
+ *       Both pins connect to the same PDN_UART pin on TMC2209
+ *
+ * AS5600 Magnetic Encoder -> Arduino Uno
+ * ----------------------------------------
+ * VCC    -> 5V (or 3.3V if available on your Uno)
+ * GND    -> GND
+ * SDA    -> A4 (I2C SDA - FIXED on Arduino Uno)
+ * SCL    -> A5 (I2C SCL - FIXED on Arduino Uno)
+ *
+ * Built-in LED
+ * ----------------------------------------
+ * LED    -> Digital Pin 13 (onboard LED, used for status indication)
+ *
+ * ============================================================================
+ * IMPORTANT NOTES
+ * ============================================================================
+ *
+ * 1. Arduino Uno I2C pins are FIXED:
+ *    - A4 = SDA (cannot be changed)
+ *    - A5 = SCL (cannot be changed)
+ *
+ * 2. AS5600 Hardware Setup:
+ *    - Place a diametric magnet above the AS5600 sensor (2-3mm distance)
+ *    - The magnet should be centered over the sensor
+ *    - Magnet polarity: one pole facing the sensor
+ *    - Recommended magnet: 6mm diameter x 2-3mm thickness
+ *
+ * 3. Sensorless Homing (StallGuard):
+ *    - DIAG pin must be connected to pin 3 (interrupt-capable)
+ *    - StallGuard detects motor stall when hitting physical limits
+ *    - Startup sequence: Move until stall, reverse, stall, then back off
+ *    - STALL_VALUE (10) controls sensitivity: higher = less sensitive
+ *
+ * 4. Power Supply:
+ *    - TMC2209 VCC_IO: 5V from Arduino
+ *    - TMC2209 VM: Separate motor power supply (typically 12V or 24V)
+ *    - AS5600 VCC: 5V from Arduino (AS5600 supports 3.3V-5V)
+ *    - Always connect grounds together (Arduino GND, motor PSU GND)
+ *
+ * 5. Serial Monitor:
+ *    - Baud rate: 115200
+ *    - Displays: Encoder angle, Degrees, Rotation count, Magnet status
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <TMCStepper.h>
+#include <SoftwareSerial.h>
+#include "EncoderReader.h"
+
+// ============================================================================
+// PIN ASSIGNMENTS FOR ARDUINO UNO
+// ============================================================================
+
+// Stepper motor control pins
+#define STEP_PIN 5   // Digital pin 5 - Step pulse for TMC2209
+#define DIR_PIN 4    // Digital pin 4 - Direction control for TMC2209
+#define ENABLE_PIN 6 // Digital pin 6 - Enable pin (LOW = enabled, HIGH = disabled)
+#define DIAG_PIN 3   // Digital pin 3 - StallGuard DIAG (INT1 - interrupt-capable)
+
+// TMC2209 UART pins (SoftwareSerial)
+#define SW_RX 7 // Digital pin 7 - RX via 1kΩ resistor to PDN_UART
+#define SW_TX 8 // Digital pin 8 - TX directly to PDN_UART
+
+// Status LED
+#define LED_PIN 13 // Digital pin 13 - Built-in LED on Arduino Uno
+
+// I2C pins for AS5600 encoder
+// NOTE: These are FIXED on Arduino Uno and cannot be changed
+// Do NOT attempt to use other pins for I2C on Uno - it will not work
+#define I2C_SDA_PIN A4 // Analog pin A4 - I2C SDA (FIXED on Uno)
+#define I2C_SCL_PIN A5 // Analog pin A5 - I2C SCL (FIXED on Uno)
+
+// ============================================================================
+// MOTOR & TMC2209 CONFIGURATION
+// ============================================================================
+
+// Motor parameters
+#define STEPS_PER_REV 200 // Standard stepper motor (1.8° per step)
+#define MICROSTEPS 256    // Microsteps setting for TMC2209
+#define STEP_DELAY 1000   // Microseconds between steps (for standalone mode)
+
+// TMC2209 Configuration
+#define R_SENSE 0.11f       // SilentStepStick series use 0.11 Ohm
+#define DRIVER_ADDRESS 0b00 // TMC2209 Driver address (MS1 and MS2 to GND)
+#define RUN_CURRENT 800     // Motor current in mA (adjust for your motor)
+#define STALL_VALUE 10      // StallGuard threshold [0..255] (lower = more sensitive)
+#define TOFF_VALUE 5        // Off time setting [1..15]
+#define HOMING_SPEED 16000  // Speed for homing sequence (VACTUAL units)
+
+// ============================================================================
+// GLOBAL OBJECTS
+// ============================================================================
+
+// Create SoftwareSerial for TMC2209 UART communication
+SoftwareSerial SoftSerial(SW_RX, SW_TX);
+
+// Create TMC2209 driver object
+TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
+
+// Create encoder instance
+EncoderReader encoder;
+
+// ============================================================================
+// HOMING STATE MACHINE
+// ============================================================================
+
+enum HomingState
+{
+  HOMING_NOT_STARTED,
+  HOMING_FIRST_SIDE,
+  HOMING_SECOND_SIDE,
+  HOMING_BACKOFF,
+  HOMING_COMPLETE
+};
+
+HomingState homingState = HOMING_NOT_STARTED;
+volatile bool stallDetected = false; // Flag set by interrupt
+
+// Update interval for serial output (milliseconds)
+const unsigned long PRINT_INTERVAL = 100; // 10Hz update rate
+unsigned long lastPrintTime = 0;
+
+// ============================================================================
+// INTERRUPT SERVICE ROUTINE - StallGuard Detection
+// ============================================================================
+
+// ISR for DIAG pin - triggered when stall is detected
+void stallInterruptHandler()
+{
+  stallDetected = true;
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup()
+{
+  // Initialize serial communication FIRST
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000)
+  {
+    // Wait for serial port to connect (max 3 seconds)
+    delay(10);
+  }
+
+  Serial.println(F("\n\nTMC2209 + AS5600"));
+  Serial.println(F("Uno v2.0 - Homing"));
+
+  // Initialize stepper motor pins
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ENABLE_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(DIAG_PIN, INPUT); // StallGuard DIAG pin
+
+  // IMPORTANT: Enable driver in hardware BEFORE UART communication
+  digitalWrite(ENABLE_PIN, LOW); // Enable driver (active LOW)
+  Serial.println(F("[HW] Driver ON"));
+
+  // Attach interrupt to DIAG pin for stall detection
+  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallInterruptHandler, RISING);
+  Serial.println(F("[HW] INT on pin 3"));
+
+  // Blink LED 3 times on startup
+  for (int i = 0; i < 3; i++)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+
+  // Initialize TMC2209 UART communication
+  Serial.println(F("\n[TMC] Init UART"));
+  SoftSerial.begin(115200);
+  TMC_Driver.beginSerial(115200);
+  delay(100);
+
+  // Configure TMC2209
+  TMC_Driver.begin();
+  TMC_Driver.toff(TOFF_VALUE);
+  TMC_Driver.rms_current(RUN_CURRENT);
+  TMC_Driver.microsteps(MICROSTEPS);
+  TMC_Driver.en_spreadCycle(false);
+  TMC_Driver.pwm_autoscale(true);
+
+  // Test UART communication
+  Serial.print(F("[TMC] UART: "));
+  uint32_t drv_status = TMC_Driver.DRV_STATUS();
+  if (drv_status == 0 || drv_status == 0xFFFFFFFF)
+  {
+    Serial.println(F("FAIL"));
+    Serial.println(F("  Chk pins 7,8->PDN"));
+  }
+  else
+  {
+    Serial.print(F("OK 0x"));
+    Serial.println(drv_status, HEX);
+  }
+
+  // Configure StallGuard for sensorless homing
+  TMC_Driver.TCOOLTHRS(0xFFFFF);
+  TMC_Driver.semin(5);
+  TMC_Driver.semax(2);
+  TMC_Driver.sedn(0b00);
+  TMC_Driver.SGTHRS(STALL_VALUE);
+
+  Serial.print(F("[TMC] I="));
+  Serial.print(RUN_CURRENT);
+  Serial.print(F("mA uStep="));
+  Serial.print(MICROSTEPS);
+  Serial.print(F(" SG="));
+  Serial.println(STALL_VALUE);
+
+  // Initialize I2C
+  Serial.println(F("[I2C] Init A4/A5"));
+  Wire.begin();
+  Wire.setClock(100000);
+
+  // Recover I2C bus
+  for (int i = 0; i < 10; i++)
+  {
+    Wire.beginTransmission(0x36);
+    Wire.endTransmission();
+    delay(10);
+  }
+
+  // Test AS5600
+  Wire.beginTransmission(0x36);
+  if (Wire.endTransmission() == 0)
+  {
+    Serial.print(F("[AS5600] "));
+    encoder.begin();
+    delay(100);
+
+    if (encoder.detectMagnet())
+    {
+      if (encoder.magnetTooStrong())
+        Serial.println(F("Strong!"));
+      else if (encoder.magnetTooWeak())
+        Serial.println(F("Weak!"));
+      else
+        Serial.println(F("OK"));
+    }
+    else
+      Serial.println(F("No mag!"));
+  }
+  else
+    Serial.println(F("[AS5600] Not found"));
+
+  // Start sensorless homing
+  Serial.println(F("\n--- HOMING ---"));
+  Serial.println(F("Moving to 1st..."));
+
+  TMC_Driver.VACTUAL(HOMING_SPEED); // Start moving
+  homingState = HOMING_FIRST_SIDE;
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+void loop()
+{
+  // Update encoder state (detects zero crossings)
+  encoder.update();
+
+  unsigned long currentTime = millis();
+  static unsigned long backoffStartTime = 0;
+
+  // ============================================================================
+  // SENSORLESS HOMING STATE MACHINE
+  // ============================================================================
+
+  if (homingState != HOMING_COMPLETE)
+  {
+    // Check for stall detection
+    if (stallDetected)
+    {
+      stallDetected = false; // Clear flag
+
+      if (homingState == HOMING_FIRST_SIDE)
+      {
+        Serial.print(F("[Home] STALL SG="));
+        Serial.println(TMC_Driver.SG_RESULT());
+        Serial.println(F("Rev to 2nd..."));
+
+        TMC_Driver.VACTUAL(-HOMING_SPEED);
+        homingState = HOMING_SECOND_SIDE;
+      }
+      else if (homingState == HOMING_SECOND_SIDE)
+      {
+        Serial.print(F("[Home] STALL SG="));
+        Serial.println(TMC_Driver.SG_RESULT());
+        Serial.println(F("Backoff 2s..."));
+
+        TMC_Driver.VACTUAL(HOMING_SPEED);
+        backoffStartTime = currentTime;
+        homingState = HOMING_BACKOFF;
+      }
+    }
+
+    // Handle backoff timing
+    if (homingState == HOMING_BACKOFF)
+    {
+      if ((currentTime - backoffStartTime) >= 2000)
+      {
+        TMC_Driver.VACTUAL(0);
+        homingState = HOMING_COMPLETE;
+        Serial.println(F("[Home] DONE!"));
+        Serial.println(F("St|Raw|Deg|Rot|Mag|SG"));
+      }
+    }
+
+    // Print status during homing
+    static unsigned long lastHomingPrint = 0;
+    if ((currentTime - lastHomingPrint) >= 100)
+    {
+      lastHomingPrint = currentTime;
+
+      Serial.print(F("SG="));
+      Serial.print(TMC_Driver.SG_RESULT());
+      Serial.print(F(" D="));
+      Serial.print(digitalRead(DIAG_PIN));
+      Serial.print(F(" I="));
+      Serial.println(TMC_Driver.cs2rms(TMC_Driver.cs_actual()));
+    }
+  }
+  else
+  {
+    // ============================================================================
+    // NORMAL OPERATION - After homing complete
+    // ============================================================================
+
+    // Print encoder and motor status
+    if (currentTime - lastPrintTime >= PRINT_INTERVAL)
+    {
+      lastPrintTime = currentTime;
+
+      // Get encoder readings
+      uint16_t rawAngle = encoder.getRawAngle();
+      float degrees = encoder.getDegrees();
+      long rotations = encoder.getRotationCount();
+
+      // Format and print data
+      int deg_int = (int)degrees;
+      int deg_frac = (int)((degrees - deg_int) * 100);
+
+      Serial.print(rawAngle);
+      Serial.print(F("|"));
+      Serial.print(deg_int);
+      Serial.print(F("."));
+      Serial.print(deg_frac);
+      Serial.print(F("|"));
+      Serial.print(rotations);
+      Serial.print(F("|"));
+
+      // Magnet status
+      if (!encoder.detectMagnet())
+        Serial.print(F("N"));
+      else if (encoder.magnetTooStrong())
+        Serial.print(F("S"));
+      else if (encoder.magnetTooWeak())
+        Serial.print(F("W"));
+      else
+        Serial.print(F("O"));
+
+      Serial.print(F("|"));
+      Serial.println(TMC_Driver.SG_RESULT());
+    }
+
+    // Blink LED to show we're in normal operation
+    static unsigned long lastBlink = 0;
+    if (currentTime - lastBlink >= 1000)
+    {
+      lastBlink = currentTime;
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
+  }
+}

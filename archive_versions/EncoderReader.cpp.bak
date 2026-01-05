@@ -19,11 +19,6 @@ EncoderReader::EncoderReader()
 // Private helper method to calculate offset-adjusted angle from hardware
 uint16_t EncoderReader::calculateRawAngle()
 {
-  // Safety check: if encoder not connected, return cached value
-  if (!encoder.isConnected()) {
-    return currentRawAngle;
-  }
-
   int32_t rawAngle = (int32_t)encoder.rawAngle() - angleOffset;
 
   // Handle wraparound to keep value in range 0-4095
@@ -40,20 +35,9 @@ void EncoderReader::begin(uint8_t directionMode)
 {
   encoder.begin(directionMode);
 
-  // Give the AS5600 time to stabilize after initialization
-  // The Pico's I2C needs a delay before the first read operation
-  delay(50);
-
   // Initialize cached values
-  // Try to read initial angle, but handle failure gracefully
-  if (encoder.isConnected()) {
-    currentRawAngle = calculateRawAngle();
-    lastAngle = currentRawAngle;
-  } else {
-    // If encoder not responding, initialize to zero
-    currentRawAngle = 0;
-    lastAngle = 0;
-  }
+  currentRawAngle = calculateRawAngle();
+  lastAngle = currentRawAngle;
 
   rotationCount = 0;
 }
@@ -62,11 +46,6 @@ void EncoderReader::begin(uint8_t directionMode)
 // This method does all the heavy lifting: reads hardware, calculates offset, detects crossings
 void EncoderReader::update()
 {
-  // Safety check: skip update if encoder not responding
-  if (!encoder.isConnected()) {
-    return;
-  }
-
   // Read hardware and calculate offset-adjusted angle (heavy lifting done here)
   currentRawAngle = calculateRawAngle();
 

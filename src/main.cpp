@@ -1,49 +1,142 @@
-// TMC2209 Test Script - adapted to use existing wiring
+/*
+ * TMC2209 Stepper Motor with AS5600 Encoder for Arduino Uno
+ *
+ * ============================================================================
+ * PIN DEFINITIONS - ARDUINO UNO
+ * ============================================================================
+ *
+ * TMC2209 Stepper Driver -> Arduino Uno
+ * ----------------------------------------
+ * STEP     -> Digital Pin 5
+ * DIR      -> Digital Pin 4
+ * EN       -> Digital Pin 6 (active LOW - pull LOW to enable driver)
+ * DIAG     -> Digital Pin 3 (StallGuard detection, INT1, interrupt-capable)
+ * PDN_UART -> Digital Pins 7 & 8 (see UART wiring below)
+ * VCC_IO   -> 5V (Arduino logic level)
+ * GND      -> GND
+ * VM       -> Motor power supply (4.75V - 29V, separate from Arduino)
+ * A1, A2, B1, B2 -> Stepper motor coils
+ *
+ * TMC2209 UART Communication (for sensorless homing)
+ * ---------------------------------------------------
+ * SW_RX    -> Digital Pin 7 (connect via 1kΩ resistor to PDN_UART)
+ * SW_TX    -> Digital Pin 8 (connect directly to PDN_UART)
+ * NOTE: A 1kΩ resistor MUST be placed between SW_RX (pin 7) and PDN_UART
+ *       SW_TX (pin 8) connects directly to PDN_UART
+ *       Both pins connect to the same PDN_UART pin on TMC2209
+ *
+ * AS5600 Magnetic Encoder -> Arduino Uno
+ * ----------------------------------------
+ * VCC    -> 5V (or 3.3V if available on your Uno)
+ * GND    -> GND
+ * SDA    -> A4 (I2C SDA - FIXED on Arduino Uno)
+ * SCL    -> A5 (I2C SCL - FIXED on Arduino Uno)
+ *
+ * Built-in LED
+ * ----------------------------------------
+ * LED    -> Digital Pin 13 (onboard LED, used for status indication)
+ *
+ * ============================================================================
+ * IMPORTANT NOTES
+ * ============================================================================
+ *
+ * 1. Arduino Uno I2C pins are FIXED:
+ *    - A4 = SDA (cannot be changed)
+ *    - A5 = SCL (cannot be changed)
+ *
+ * 2. AS5600 Hardware Setup:
+ *    - Place a diametric magnet above the AS5600 sensor (2-3mm distance)
+ *    - The magnet should be centered over the sensor
+ *    - Magnet polarity: one pole facing the sensor
+ *    - Recommended magnet: 6mm diameter x 2-3mm thickness
+ *
+ * 3. Sensorless Homing (StallGuard):
+ *    - DIAG pin must be connected to pin 3 (interrupt-capable)
+ *    - StallGuard detects motor stall when hitting physical limits
+ *    - Startup sequence: Move until stall, reverse, stall, then back off
+ *    - STALL_VALUE (10) controls sensitivity: higher = less sensitive
+ *
+ * 4. Power Supply:
+ *    - TMC2209 VCC_IO: 5V from Arduino
+ *    - TMC2209 VM: Separate motor power supply (typically 12V or 24V)
+ *    - AS5600 VCC: 5V from Arduino (AS5600 supports 3.3V-5V)
+ *    - Always connect grounds together (Arduino GND, motor PSU GND)
+ *
+ * 5. Serial Monitor:
+ *    - Baud rate: 115200
+ *    - Displays: Encoder angle, Degrees, Rotation count, Magnet status
+ */
 
 #include <Arduino.h>
+#include <Wire.h>
 #include <TMCStepper.h>
 #include <SoftwareSerial.h>
+#include <AccelStepper.h>
+#include "EncoderReader.h"
 
-// Commenting out for test
-// #include <Wire.h>
-// #include <AccelStepper.h>
-// #include "EncoderReader.h"
+// ============================================================================
+// PIN ASSIGNMENTS FOR ARDUINO UNO
+// ============================================================================
 
-// AS5600 Encoder I2C Pins (for reference - Wire library uses these by default)
-// For Arduino Uno/Nano: SDA = A4, SCL = A5
-// For Arduino Mega: SDA = 20, SCL = 21
-// Note: Most AS5600 modules have built-in pull-up resistors
-#define SDA_PIN A4 // I2C Data
-#define SCL_PIN A5 // I2C Clock
+// Stepper motor control pins
+#define STEP_PIN 5   // Digital pin 5 - Step pulse for TMC2209
+#define DIR_PIN 4    // Digital pin 4 - Direction control for TMC2209
+#define ENABLE_PIN 6 // Digital pin 6 - Enable pin (LOW = enabled, HIGH = disabled)
+#define DIAG_PIN 3   // Digital pin 3 - StallGuard DIAG (INT1 - interrupt-capable)
 
-// TMC2209 Stepper Driver Pins
-#define STEP_PIN 5
-#define DIR_PIN 4
-#define ENABLE_PIN 6
-#define SW_RX 7      // SoftwareSerial RX (connect to TMC2209 PDN_UART via 1k resistor to SW_TX)
-#define SW_TX 8      // SoftwareSerial TX (connect to TMC2209 PDN_UART)
-#define STALLGUARD 3 // DIAG pin from TMC2209
+// TMC2209 UART pins (SoftwareSerial)
+#define SW_RX 7 // Digital pin 7 - RX via 1kΩ resistor to PDN_UART
+#define SW_TX 8 // Digital pin 8 - TX directly to PDN_UART
+
+// Status LED
+#define LED_PIN 13 // Digital pin 13 - Built-in LED on Arduino Uno
+
+// I2C pins for AS5600 encoder
+// NOTE: These are FIXED on Arduino Uno and cannot be changed
+// Do NOT attempt to use other pins for I2C on Uno - it will not work
+#define I2C_SDA_PIN A4 // Analog pin A4 - I2C SDA (FIXED on Uno)
+#define I2C_SCL_PIN A5 // Analog pin A5 - I2C SCL (FIXED on Uno)
+
+// Joystick pins
+#define JOYSTICK_VRX A0 // Analog pin A0 - Joystick X-axis (VRx)
+#define JOYSTICK_SW 2   // Digital pin 2 - Joystick button (INT0, interrupt-capable)
+
+// ============================================================================
+// MOTOR & TMC2209 CONFIGURATION
+// ============================================================================
+
+// Motor parameters
+#define STEPS_PER_REV 200 // Standard stepper motor (1.8° per step)
+#define MICROSTEPS 2      // Microsteps setting for TMC2209
+#define STEP_DELAY 100    // Microseconds between steps (for homing) 700?
 
 // TMC2209 Configuration
 #define R_SENSE 0.11f       // SilentStepStick series use 0.11 Ohm
-#define DRIVER_ADDRESS 0b00 // TMC2209 Driver address according to MS1 and MS2
-#define RUN_CURRENT 1770    // Motor current in mA (adjust based on your motor specs)
-#define MICROSTEPS 256      // Microsteps setting (1, 2, 4, 8, 16, 32, 64, 128, 256)
+#define DRIVER_ADDRESS 0b00 // TMC2209 Driver address (MS1 and MS2 to GND)
+#define RUN_CURRENT 500     // Motor current in mA (adjust for your motor)
+#define STALL_VALUE 24      // StallGuard threshold [0..255] (lower = more sensitive)
+#define TOFF_VALUE 4        // Off time setting [1..15]
 
-// StallGuard Configuration
-#define STALL_VALUE 100 // [0..255] - Higher = less sensitive, Lower = more sensitive
-#define TOFF_VALUE 5    // [1..15] Off time setting
-#define STALL_CURRENT_THRESHOLD 1000 // Current threshold in mA for stall detection
+// AccelStepper Configuration
+#define MAX_SPEED 9000.0                         // Maximum speed in steps/second
+#define ACCELERATION 10000.0                     // Acceleration in steps/second^2
+#define DEFAULT_SPEED 1000.0                     // Default speed for moves
+#define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS) // Total steps per revolution
 
-// Homing Configuration
-#define HOMING_SPEED 100000 // VACTUAL speed for homing (lower = slower, safer)
+// Movement parameters
+#define HOMING_BACKOFF_STEPS 500 // Steps to back off after hitting stall
+#define SAFETY_BUFFER_STEPS 50   // Safety buffer from hard limits (microsteps)
 
-// Other I/O Pins
-#define LED_PIN 13
-#define JOYSTICK_VRX A0
-#define JOYSTICK_SW 2
-#define STEPS_PER_REV 200
-#define TOTAL_STEPS (STEPS_PER_REV * MICROSTEPS)
+// Joystick parameters
+#define JOYSTICK_CENTER 512         // Center position (ADC value 0-1023)
+#define JOYSTICK_DEADZONE 50        // Deadzone around center (prevents drift)
+#define JOYSTICK_HALF_THRESHOLD 150 // Threshold for half vs full speed
+#define JOYSTICK_MIN 0              // Minimum ADC value
+#define JOYSTICK_MAX 800            // Maximum ADC value
+
+// ============================================================================
+// GLOBAL OBJECTS
+// ============================================================================
 
 // Create SoftwareSerial for TMC2209 UART communication
 SoftwareSerial SoftSerial(SW_RX, SW_TX);
@@ -51,627 +144,981 @@ SoftwareSerial SoftSerial(SW_RX, SW_TX);
 // Create TMC2209 driver object
 TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
 
-// Homing state machine
-enum HomingState {
-  HOMING_IDLE,
-  HOMING_FORWARD,
-  HOMING_BACKWARD,
-  HOMING_TO_CENTER,
-  HOMING_COMPLETE
+// Create AccelStepper object using DRIVER mode (step/direction interface)
+// AccelStepper stepper(interface, stepPin, directionPin)
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+// Create encoder instance
+EncoderReader encoder;
+
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+
+volatile bool stallDetected = false; // Flag set by interrupt
+bool shaftVal = false;               // Direction: false = forward, true = reverse
+
+// Homing limit positions
+long firstLimitPosition = 0;
+long secondLimitPosition = 0;
+long minLimit = 0;
+long maxLimit = 0;
+long safeMinLimit = 0;  // Min limit + safety buffer
+long safeMaxLimit = 0;  // Max limit - safety buffer
+long centerPosition = 0;
+bool isHomed = false;
+
+// Update interval for serial output (milliseconds)
+const unsigned long PRINT_INTERVAL = 100; // 10Hz update rate
+unsigned long lastPrintTime = 0;
+
+// ============================================================================
+// POSITION MARKER SYSTEM - DATA STRUCTURES
+// ============================================================================
+
+// System states
+enum SystemState
+{
+  STATE_STARTUP,        // Before homing
+  STATE_READY,          // Normal operation
+  STATE_DISABLED,       // Motor disabled for manual positioning
+  STATE_PLAYBACK_DELAY, // 5-second countdown
+  STATE_PLAYBACK        // Executing playback sequence
 };
 
-HomingState homingState = HOMING_IDLE;
-int32_t firstLimitPosition = 0;
-int32_t secondLimitPosition = 0;
-uint8_t stallConfirmCount = 0; // Counter to confirm stall detection
-
-//== Setup ======================================================================================
-
-void setup()
+// Encoder calibration (captured during homing)
+struct EncoderCalibration
 {
+  long minLimitRotations;
+  uint16_t minLimitRawAngle;
+  long minLimitStepperPos;
+  long maxLimitRotations;
+  uint16_t maxLimitRawAngle;
+  long maxLimitStepperPos;
+  float stepsPerEncoderUnit;
+  float encoderRotationsPerStepperRotation;  // Gear ratio for rotation-based conversion
+  bool isCalibrated;
+};
 
-  Serial.begin(115200); // initialize hardware serial for debugging
-  while (!Serial)
-    ;                       // Wait for serial port to connect
-  SoftSerial.begin(115200); // initialize software serial for UART motor control
+// Position markers (encoder readings)
+struct PositionMarker
+{
+  long rotationCount;
+  uint16_t rawAngle;
+  bool isSet;
+};
 
-  // IMPORTANT: Enable driver in hardware BEFORE UART communication
-  pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, LOW); // Enable driver in hardware (active LOW)
-  pinMode(STEP_PIN, OUTPUT);
-  pinMode(DIR_PIN, OUTPUT);
-  pinMode(STALLGUARD, INPUT); // DIAG pin for real-time stall detection
+// Button state tracking
+struct ButtonState
+{
+  bool currentState;
+  bool lastState;
+  unsigned long pressStartTime;
+  unsigned long releaseTime;
+  bool isPressed;
+  bool longPressTriggered;
+};
 
-  Serial.println("TMC2209 StallGuard Test with Joystick Control");
-  Serial.println("Wiring: EN=6, DIR=4, STEP=5, SW_RX=7, SW_TX=8");
-  Serial.println("IMPORTANT: VIO to 5V, GND to GND, 1k resistor between pins 7 and 8 to PDN_UART");
-  delay(500);
+// Playback sequence state
+struct PlaybackState
+{
+  uint8_t currentMarkerIndex;
+  unsigned long delayStartTime;
+  unsigned long pauseStartTime;
+  bool movingToStart;
+  bool isComplete;
+};
 
-  TMC_Driver.beginSerial(115200); // Initialize UART
+// Constants
+const uint8_t MAX_MARKERS = 3;
+const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long LONG_PRESS_TIME = 2000;
+const unsigned long SHORT_PRESS_MAX = 500;
+const unsigned long PLAYBACK_DELAY_MS = 5000;
+const unsigned long MARKER_PAUSE_MS = 500;
 
-  TMC_Driver.begin();           // UART: Init SW UART (if selected) with default 115200 baudrate
-  TMC_Driver.toff(5);           // Enables driver in software
-  TMC_Driver.rms_current(1770); // Set motor RMS current (1770mA)
-  TMC_Driver.microsteps(256);   // Set microsteps to 256
+// Globals
+SystemState currentState = STATE_STARTUP;
+EncoderCalibration encoderCal;
+PositionMarker markers[MAX_MARKERS];
+uint8_t markerCount = 0;
+ButtonState button;
+PlaybackState playback;
 
-  // StallGuard configuration
-  TMC_Driver.TCOOLTHRS(0xFFFFF);  // 20bit max - Enable StallGuard (velocity threshold)
-  TMC_Driver.semin(5);            // Minimum StallGuard value for smart current control
-  TMC_Driver.semax(2);            // Maximum StallGuard value for smart current control
-  TMC_Driver.sedn(0b01);          // Current down step speed
-  TMC_Driver.SGTHRS(STALL_VALUE); // StallGuard threshold [0..255]
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
 
-  TMC_Driver.en_spreadCycle(false); // Toggle spreadCycle (false = use StealthChop)
-  TMC_Driver.pwm_autoscale(true);   // Needed for stealthChop
+long encoderToStepperPosition(long rotationCount, uint16_t rawAngle);
 
-  Serial.println("TMC2209 configured with StallGuard!");
+// ============================================================================
+// INTERRUPT SERVICE ROUTINE - StallGuard Detection
+// ============================================================================
 
-  // Verify driver is enabled
-  Serial.print("Driver toff: ");
-  Serial.println(TMC_Driver.toff());
-
-  Serial.println("Starting automatic homing sequence...");
-  Serial.println("Will detect stalls when current > 1000mA");
-  Serial.print("Homing speed: ");
-  Serial.println(HOMING_SPEED);
-  delay(1000);
-
-  // Start homing sequence
-  homingState = HOMING_FORWARD;
-  TMC_Driver.VACTUAL(HOMING_SPEED); // Start moving forward
-  Serial.println("HOMING: Moving forward to find first limit...");
-  Serial.print("VACTUAL set to: ");
-  Serial.println(HOMING_SPEED);
+// ISR for DIAG pin - triggered when stall is detected
+void stallInterruptHandler()
+{
+  stallDetected = true;
+  // Note: Keep ISR minimal - detailed debugging happens in main loop
 }
 
-//== Loop ========================================================================================
+// ============================================================================
+// MOTOR CONTROL FUNCTIONS
+// ============================================================================
 
-void loop()
+// Move motor by relative steps (positive = forward, negative = backward)
+void moveRelative(long steps)
 {
-  static uint32_t last_time = 0;
-  static int32_t virtualPosition = 0; // Track virtual position since TMC2209 doesn't have position counter
-  uint32_t ms = millis();
+  stepper.move(steps);
+  Serial.print(F("Moving by "));
+  Serial.print(steps);
+  Serial.println(F(" steps"));
+}
 
-  // Get current motor status
-  uint16_t currentReading = TMC_Driver.cs2rms(TMC_Driver.cs_actual());
-  uint16_t sgResult = TMC_Driver.SG_RESULT();
-  bool diagPin = digitalRead(STALLGUARD);
+// Rotate motor by degrees (based on TOTAL_STEPS configuration)
+void rotateDegrees(float degrees)
+{
+  long steps = (long)((degrees / 360.0) * TOTAL_STEPS);
+  stepper.move(steps);
+  Serial.print(F("Rotating "));
+  Serial.print(degrees);
+  Serial.print(F("° ("));
+  Serial.print(steps);
+  Serial.println(F(" steps)"));
+}
 
-  // Stall detection with confirmation (need 3 consecutive high readings)
-  bool currentHigh = (currentReading > STALL_CURRENT_THRESHOLD);
-  if (currentHigh)
+// Generate step pulses for motor movement (OLD - kept for homing compatibility)
+// Used during sensorless homing where blocking movement is needed
+void motor(int steps, int stepDelay)
+{
+  digitalWrite(ENABLE_PIN, LOW);   // Ensure driver is enabled
+  digitalWrite(DIR_PIN, shaftVal); // Set direction via hardware pin
+
+  for (int i = 0; i < steps; i++)
   {
-    stallConfirmCount++;
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(stepDelay);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(stepDelay);
+
+    // Check for stall during movement
+    if (stallDetected)
+    {
+      break;
+    }
+  }
+}
+
+// Helper function: Move until stall is detected (used for finding limits)
+// Returns the position where stall was detected
+// ignoreSteps: number of steps to move before checking for stall (to clear "hot" stall signal)
+long moveUntilStall(float speed, const char *stepLabel, long ignoreSteps = 0)
+{
+  Serial.print(F("\n["));
+  Serial.print(stepLabel);
+  Serial.println(F("] Finding limit..."));
+
+  stepper.setSpeed(speed);
+  long startPosition = stepper.currentPosition();
+
+  // Clear any pending stall flag
+  stallDetected = false;
+
+  while (!stallDetected)
+  {
+    stepper.runSpeed();
+    encoder.update();
+
+    // Ignore stall detection for the first ignoreSteps
+    if (abs(stepper.currentPosition() - startPosition) < ignoreSteps)
+    {
+      stallDetected = false; // Keep clearing the flag during ignore period
+    }
+
+    // Serial printing disabled during movement to prevent stuttering
+    // Printing blocks execution and interrupts smooth stepper pulses
+  }
+
+  long stallPosition = stepper.currentPosition();
+  Serial.print(F("["));
+  Serial.print(stepLabel);
+  Serial.print(F("] Limit found at position: "));
+  Serial.println(stallPosition);
+
+  stepper.setSpeed(0);
+  delay(100);
+
+  return stallPosition;
+}
+
+// Helper function: Move to target position and print progress
+void moveToPosition(long targetPosition, float speed, unsigned long printInterval)
+{
+  long stepsToMove = targetPosition - stepper.currentPosition();
+  float moveSpeed = (stepsToMove > 0) ? speed : -speed;
+  stepper.setSpeed(moveSpeed);
+
+  while ((stepsToMove > 0) ? (stepper.currentPosition() < targetPosition) : (stepper.currentPosition() > targetPosition))
+  {
+    stepper.runSpeed();
+    encoder.update();
+
+    // Serial printing disabled during movement to prevent stuttering
+  }
+
+  stepper.setSpeed(0);
+}
+
+// Homing routine - uses StallGuard to find limits on both ends, then returns to center
+// Uses runSpeed() for constant speed movement with no acceleration (5000 microsteps/s)
+void homeX()
+{
+  const float HOMING_SPEED = 800.0; // works OK with #define MICROSTEPS 2
+
+  Serial.println(F("\n=== HOMING SEQUENCE START ==="));
+  Serial.print(F("Homing speed: "));
+  Serial.print(HOMING_SPEED);
+  Serial.println(F(" microsteps/s (~312 full steps/s)"));
+
+  stallDetected = false;
+  delay(100);
+
+  Serial.println(F("[Home] Attaching interrupt..."));
+  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallInterruptHandler, RISING);
+  delay(10);
+  stallDetected = false;
+
+  // STEP 1: Find first limit (negative direction)
+  moveUntilStall(-HOMING_SPEED, "Step 1", 100);
+
+  firstLimitPosition = 0;
+  stepper.setCurrentPosition(0);
+
+  // CRITICAL: Reset encoder to create consistent reference frame
+  encoder.setRotationCount(0);
+  Serial.println(F("[Step 1] Encoder rotation count reset to 0"));
+
+  Serial.print(F("[Step 1] First limit set at position: "));
+  Serial.println(firstLimitPosition);
+
+  // Capture encoder position at first limit (min limit)
+  encoderCal.minLimitRotations = encoder.getRotationCount();
+  encoderCal.minLimitRawAngle = encoder.getRawAngle();
+  encoderCal.minLimitStepperPos = 0;
+  Serial.print(F("[Calibration] Min limit encoder: rot="));
+  Serial.print(encoderCal.minLimitRotations);
+  Serial.print(F(" raw="));
+  Serial.println(encoderCal.minLimitRawAngle);
+
+  // STEP 2: Find second limit (positive direction)
+  // Ignore first 100 steps to clear "hot" stall signal from Step 1
+  moveUntilStall(HOMING_SPEED, "Step 2", 100);
+
+  secondLimitPosition = stepper.currentPosition();
+
+  // Capture encoder position at second limit (max limit)
+  encoderCal.maxLimitRotations = encoder.getRotationCount();
+  encoderCal.maxLimitRawAngle = encoder.getRawAngle();
+  encoderCal.maxLimitStepperPos = stepper.currentPosition();
+  Serial.print(F("[Calibration] Max limit encoder: rot="));
+  Serial.print(encoderCal.maxLimitRotations);
+  Serial.print(F(" raw="));
+  Serial.println(encoderCal.maxLimitRawAngle);
+
+  // Calculate limits and center
+  minLimit = (firstLimitPosition < secondLimitPosition) ? firstLimitPosition : secondLimitPosition;
+  maxLimit = (firstLimitPosition < secondLimitPosition) ? secondLimitPosition : firstLimitPosition;
+  centerPosition = (minLimit + maxLimit) / 2;
+
+  // Calculate safe limits with buffer
+  safeMinLimit = minLimit + SAFETY_BUFFER_STEPS;
+  safeMaxLimit = maxLimit - SAFETY_BUFFER_STEPS;
+
+  Serial.println(F("\n=== HOMING RESULTS ==="));
+  Serial.print(F("First limit:  "));
+  Serial.println(firstLimitPosition);
+  Serial.print(F("Second limit: "));
+  Serial.println(secondLimitPosition);
+  Serial.print(F("Min limit:    "));
+  Serial.println(minLimit);
+  Serial.print(F("Max limit:    "));
+  Serial.println(maxLimit);
+  Serial.print(F("Safe min:     "));
+  Serial.println(safeMinLimit);
+  Serial.print(F("Safe max:     "));
+  Serial.println(safeMaxLimit);
+  Serial.print(F("Range:        "));
+  Serial.print(maxLimit - minLimit);
+  Serial.println(F(" steps"));
+  Serial.print(F("Center:       "));
+  Serial.println(centerPosition);
+
+  // Calculate encoder calibration using rotation-based math
+  float encoderMinRot = (float)encoderCal.minLimitRotations +
+                        (encoderCal.minLimitRawAngle / 4096.0);
+  float encoderMaxRot = (float)encoderCal.maxLimitRotations +
+                        (encoderCal.maxLimitRawAngle / 4096.0);
+  float encoderRotationRange = encoderMaxRot - encoderMinRot;
+
+  float stepperRotationRange = (maxLimit - minLimit) / (float)(STEPS_PER_REV * MICROSTEPS);
+
+  encoderCal.encoderRotationsPerStepperRotation = encoderRotationRange / stepperRotationRange;
+
+  // Keep legacy calculation for backward compatibility
+  long encoderMin = (encoderCal.minLimitRotations * 4096L) + encoderCal.minLimitRawAngle;
+  long encoderMax = (encoderCal.maxLimitRotations * 4096L) + encoderCal.maxLimitRawAngle;
+  long encoderRange = abs(encoderMax - encoderMin);
+  long stepperRange = maxLimit - minLimit;
+  encoderCal.stepsPerEncoderUnit = (float)stepperRange / (float)encoderRange;
+  encoderCal.isCalibrated = true;
+
+  Serial.println(F("\n=== ENCODER CALIBRATION ==="));
+  Serial.print(F("Encoder rotations: "));
+  Serial.println(encoderRotationRange, 6);
+  Serial.print(F("Stepper rotations: "));
+  Serial.println(stepperRotationRange, 6);
+  Serial.print(F("Encoder/Stepper ratio: "));
+  Serial.println(encoderCal.encoderRotationsPerStepperRotation, 6);
+  Serial.print(F("Steps/unit (legacy): "));
+  Serial.println(encoderCal.stepsPerEncoderUnit, 6);
+
+  // Verify calibration by converting limits back
+  long verifyMin = encoderToStepperPosition(
+      encoderCal.minLimitRotations,
+      encoderCal.minLimitRawAngle);
+  long verifyMax = encoderToStepperPosition(
+      encoderCal.maxLimitRotations,
+      encoderCal.maxLimitRawAngle);
+
+  Serial.println(F("\n=== CALIBRATION VERIFICATION ==="));
+  Serial.print(F("Min limit: "));
+  Serial.print(verifyMin);
+  Serial.print(F(" (expect ~"));
+  Serial.print(safeMinLimit);
+  Serial.println(F(")"));
+  Serial.print(F("Max limit: "));
+  Serial.print(verifyMax);
+  Serial.print(F(" (expect ~"));
+  Serial.print(safeMaxLimit);
+  Serial.println(F(")"));
+
+  detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
+  Serial.println(F("[Home] Interrupt detached"));
+
+  // STEP 3: Move to center position using full AccelStepper capabilities
+  Serial.println(F("\n[Step 3] Moving to center with acceleration..."));
+  Serial.print(F("Current position: "));
+  Serial.println(stepper.currentPosition());
+  Serial.print(F("Target position:  "));
+  Serial.println(centerPosition);
+  Serial.print(F("Steps to center:  "));
+  Serial.println(centerPosition - stepper.currentPosition());
+  Serial.print(F("Max speed:        "));
+  Serial.print(stepper.maxSpeed());
+  Serial.println(F(" steps/s"));
+  Serial.print(F("Acceleration:     "));
+  Serial.print(stepper.acceleration());
+  Serial.println(F(" steps/s²"));
+
+  // Use moveTo() for accelerated movement to center
+  stepper.moveTo(centerPosition);
+
+  // Run motor with acceleration until target is reached
+  // NO Serial.print() here - blocking I/O causes stuttering!
+  while (stepper.distanceToGo() != 0)
+  {
+    stepper.run();
+    encoder.update();
+  }
+
+  Serial.print(F("[Step 3] Arrived at center! Position="));
+  Serial.println(stepper.currentPosition());
+  Serial.print(F("Final speed: "));
+  Serial.print(stepper.speed());
+  Serial.println(F(" steps/s"));
+
+  isHomed = true;
+  currentState = STATE_READY;
+  Serial.println(F("\n=== HOMING COMPLETE ===\n"));
+}
+
+// ============================================================================
+// POSITION MARKER SYSTEM - HELPER FUNCTIONS
+// ============================================================================
+
+// Button handler (non-blocking)
+// Returns: 0 = no event, 1 = short press, 2 = long press
+uint8_t updateButton()
+{
+  uint8_t event = 0;
+  button.currentState = (digitalRead(JOYSTICK_SW) == LOW);
+  unsigned long currentTime = millis();
+
+  // Detect press with debouncing
+  if (button.currentState && !button.lastState)
+  {
+    if (currentTime - button.releaseTime > DEBOUNCE_DELAY)
+    {
+      button.pressStartTime = currentTime;
+      button.isPressed = true;
+      button.longPressTriggered = false;
+    }
+  }
+
+  // Detect long press while held
+  if (button.isPressed && !button.longPressTriggered)
+  {
+    if (currentTime - button.pressStartTime >= LONG_PRESS_TIME)
+    {
+      button.longPressTriggered = true;
+      event = 2; // Long press
+    }
+  }
+
+  // Detect release
+  if (!button.currentState && button.lastState)
+  {
+    if (currentTime - button.pressStartTime > DEBOUNCE_DELAY)
+    {
+      button.releaseTime = currentTime;
+      if (button.isPressed && !button.longPressTriggered)
+      {
+        unsigned long duration = currentTime - button.pressStartTime;
+        if (duration < SHORT_PRESS_MAX)
+        {
+          event = 1; // Short press
+        }
+      }
+      button.isPressed = false;
+    }
+  }
+
+  button.lastState = button.currentState;
+  return event;
+}
+
+// Convert encoder position to stepper position (rotation-based math)
+long encoderToStepperPosition(long rotationCount, uint16_t rawAngle)
+{
+  if (!encoderCal.isCalibrated)
+    return 0;
+
+  // Calculate encoder position in rotations (floating point precision)
+  float encoderRotations = (float)rotationCount + (rawAngle / 4096.0);
+  float encoderMinRotations = (float)encoderCal.minLimitRotations +
+                               (encoderCal.minLimitRawAngle / 4096.0);
+  float encoderRelativeRotations = encoderRotations - encoderMinRotations;
+
+  // Convert to stepper rotations, then to steps
+  float stepperRelativeRotations = encoderRelativeRotations /
+                                    encoderCal.encoderRotationsPerStepperRotation;
+  long stepperRelativeSteps = (long)(stepperRelativeRotations * STEPS_PER_REV * MICROSTEPS);
+  long stepperPos = encoderCal.minLimitStepperPos + stepperRelativeSteps;
+
+  // Clamp to safe range (with buffer)
+  if (stepperPos < safeMinLimit)
+    stepperPos = safeMinLimit;
+  if (stepperPos > safeMaxLimit)
+    stepperPos = safeMaxLimit;
+
+  return stepperPos;
+}
+
+// Save current encoder position as marker
+bool saveMarker()
+{
+  if (markerCount >= MAX_MARKERS)
+  {
+    Serial.println(F("[Marker] Already at max (3) markers!"));
+    return false;
+  }
+
+  long currentRotations = encoder.getRotationCount();
+  uint16_t currentRawAngle = encoder.getRawAngle();
+  long stepperPos = encoderToStepperPosition(currentRotations, currentRawAngle);
+
+  markers[markerCount].rotationCount = currentRotations;
+  markers[markerCount].rawAngle = currentRawAngle;
+  markers[markerCount].isSet = true;
+
+  Serial.print(F("[Marker] Saved #"));
+  Serial.print(markerCount + 1);
+  Serial.print(F(" at stepper pos: "));
+  Serial.println(stepperPos);
+
+  markerCount++;
+  return true;
+}
+
+// Clear all markers
+void clearMarkers()
+{
+  for (uint8_t i = 0; i < MAX_MARKERS; i++)
+  {
+    markers[i].isSet = false;
+  }
+  markerCount = 0;
+}
+
+// Determine which end position is closest to first marker
+long determineStartPosition()
+{
+  if (markerCount == 0)
+    return minLimit;
+
+  long firstMarkerPos = encoderToStepperPosition(
+      markers[0].rotationCount, markers[0].rawAngle);
+
+  long distToMin = abs(firstMarkerPos - minLimit);
+  long distToMax = abs(firstMarkerPos - maxLimit);
+
+  return (distToMin < distToMax) ? minLimit : maxLimit;
+}
+
+// Sort markers based on start position
+void sortMarkers(long startPosition)
+{
+  if (markerCount <= 1)
+    return;
+
+  long markerPositions[MAX_MARKERS];
+  for (uint8_t i = 0; i < markerCount; i++)
+  {
+    markerPositions[i] = encoderToStepperPosition(
+        markers[i].rotationCount, markers[i].rawAngle);
+  }
+
+  bool ascending = (startPosition == minLimit);
+  for (uint8_t i = 0; i < markerCount - 1; i++)
+  {
+    for (uint8_t j = 0; j < markerCount - i - 1; j++)
+    {
+      bool swap = ascending ? (markerPositions[j] > markerPositions[j + 1]) : (markerPositions[j] < markerPositions[j + 1]);
+
+      if (swap)
+      {
+        long tempPos = markerPositions[j];
+        markerPositions[j] = markerPositions[j + 1];
+        markerPositions[j + 1] = tempPos;
+
+        PositionMarker tempMarker = markers[j];
+        markers[j] = markers[j + 1];
+        markers[j + 1] = tempMarker;
+      }
+    }
+  }
+}
+
+// Sort markers by stepper position (ascending order)
+void sortMarkersByPosition()
+{
+  if (markerCount <= 1)
+    return;
+
+  // Bubble sort markers by stepper position (ascending)
+  for (uint8_t i = 0; i < markerCount - 1; i++)
+  {
+    for (uint8_t j = 0; j < markerCount - i - 1; j++)
+    {
+      long posJ = encoderToStepperPosition(markers[j].rotationCount, markers[j].rawAngle);
+      long posJplus1 = encoderToStepperPosition(markers[j + 1].rotationCount, markers[j + 1].rawAngle);
+
+      if (posJ > posJplus1)
+      {
+        PositionMarker temp = markers[j];
+        markers[j] = markers[j + 1];
+        markers[j + 1] = temp;
+      }
+    }
+  }
+
+  Serial.println(F("[Playback] Markers sorted by position:"));
+  for (uint8_t i = 0; i < markerCount; i++)
+  {
+    long pos = encoderToStepperPosition(markers[i].rotationCount, markers[i].rawAngle);
+    Serial.print(F("  Marker "));
+    Serial.print(i + 1);
+    Serial.print(F(": "));
+    Serial.println(pos);
+  }
+}
+
+// Initialize playback sequence
+void initializePlayback()
+{
+  // Sort markers by position (ascending order)
+  sortMarkersByPosition();
+
+  playback.currentMarkerIndex = 0;
+  playback.movingToStart = true; // Now means "moving to first marker"
+  playback.isComplete = false;
+
+  // Calculate first marker's stepper position
+  long firstMarkerPos = encoderToStepperPosition(
+      markers[0].rotationCount,
+      markers[0].rawAngle);
+
+  Serial.print(F("[Playback] Moving to first marker at stepper pos: "));
+  Serial.println(firstMarkerPos);
+  stepper.moveTo(firstMarkerPos);
+}
+
+// ============================================================================
+// POSITION MARKER SYSTEM - STATE HANDLERS
+// ============================================================================
+
+void handleStartupState()
+{
+  static bool homingStarted = false;
+  if (!homingStarted)
+  {
+    homingStarted = true;
+    homeX(); // Sets currentState = STATE_READY at end
+  }
+}
+
+void handleReadyState(uint8_t buttonEvent)
+{
+  if (buttonEvent == 2)
+  { // Long press
+    Serial.println(F("\n=== MOTOR DISABLED ==="));
+    Serial.println(F("Move motor manually to desired positions"));
+    Serial.println(F("SHORT press to save position (max 3)"));
+    Serial.println(F("LONG press to start playback sequence\n"));
+    digitalWrite(ENABLE_PIN, HIGH);
+    clearMarkers();
+    currentState = STATE_DISABLED;
+  }
+}
+
+void handleDisabledState(uint8_t buttonEvent)
+{
+  if (buttonEvent == 1)
+  { // Short press
+    saveMarker();
+  }
+  else if (buttonEvent == 2)
+  { // Long press
+    if (markerCount == 0)
+    {
+      Serial.println(F("[Error] No markers saved!"));
+      return;
+    }
+    Serial.println(F("\n=== STARTING PLAYBACK ==="));
+    playback.delayStartTime = millis();
+    currentState = STATE_PLAYBACK_DELAY;
+  }
+
+  // Display position periodically
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 200)
+  {
+    Serial.print(F("DISABLED - Enc: "));
+    Serial.print(encoder.getRotationCount());
+    Serial.print(F(":"));
+    Serial.print(encoder.getRawAngle());
+    Serial.print(F(" | Markers: "));
+    Serial.print(markerCount);
+    Serial.print(F("/"));
+    Serial.println(MAX_MARKERS);
+    lastPrint = millis();
+  }
+}
+
+void handlePlaybackDelayState()
+{
+  unsigned long elapsed = millis() - playback.delayStartTime;
+
+  static unsigned long lastCountdown = 0;
+  if (millis() - lastCountdown > 1000)
+  {
+    Serial.print(F("[Playback] Starting in "));
+    Serial.print((PLAYBACK_DELAY_MS - elapsed) / 1000);
+    Serial.println(F("s..."));
+    lastCountdown = millis();
+  }
+
+  if (elapsed >= PLAYBACK_DELAY_MS)
+  {
+    Serial.println(F("[Playback] BEGIN!"));
+    digitalWrite(ENABLE_PIN, LOW); // Enable motor
+    delay(100);
+    initializePlayback();
+    currentState = STATE_PLAYBACK;
+  }
+}
+
+void handlePlaybackState()
+{
+  if (stepper.distanceToGo() != 0)
+    return; // Still moving
+
+  if (playback.movingToStart)
+  {
+    // Arrived at first marker, start the sequence
+    Serial.println(F("[Playback] At first marker, starting sequence"));
+    playback.movingToStart = false;
+    playback.pauseStartTime = millis();
+    playback.currentMarkerIndex = 1; // Skip first marker (already there)
+    return;
+  }
+
+  if (playback.pauseStartTime > 0)
+  {
+    if (millis() - playback.pauseStartTime < MARKER_PAUSE_MS)
+    {
+      return; // Still pausing
+    }
+    playback.pauseStartTime = 0;
+  }
+
+  if (playback.currentMarkerIndex < markerCount)
+  {
+    long targetPos = encoderToStepperPosition(
+        markers[playback.currentMarkerIndex].rotationCount,
+        markers[playback.currentMarkerIndex].rawAngle);
+
+    Serial.print(F("[Playback] Marker #"));
+    Serial.println(playback.currentMarkerIndex + 1);
+    stepper.moveTo(targetPos);
+    playback.pauseStartTime = millis();
+    playback.currentMarkerIndex++;
+  }
+  else if (!playback.isComplete)
+  {
+    // Determine which end is furthest from last marker
+    long lastMarkerPos = encoderToStepperPosition(
+        markers[markerCount - 1].rotationCount,
+        markers[markerCount - 1].rawAngle);
+
+    long distToMin = abs(lastMarkerPos - safeMinLimit);
+    long distToMax = abs(lastMarkerPos - safeMaxLimit);
+    long endPos = (distToMin > distToMax) ? safeMinLimit : safeMaxLimit;
+
+    Serial.print(F("[Playback] Moving to opposite end: "));
+    Serial.println(endPos);
+    stepper.moveTo(endPos);
+    playback.isComplete = true;
   }
   else
   {
-    stallConfirmCount = 0;
+    Serial.println(F("\n=== PLAYBACK COMPLETE ==="));
+    currentState = STATE_READY;
+    clearMarkers();
   }
-  bool stallDetected = (stallConfirmCount >= 3);
+}
 
-  // Homing state machine
-  switch (homingState)
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup()
+{
+  // Initialize serial communication FIRST
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000)
   {
-  case HOMING_FORWARD:
-    // Check for stall in forward direction
-    if (stallDetected)
+    // Wait for serial port to connect (max 3 seconds)
+    delay(10);
+  }
+
+  Serial.println(F("\n\nTMC2209 + AS5600"));
+  Serial.println(F("Uno v2.0 - Homing"));
+
+  // Initialize stepper motor pins
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ENABLE_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(DIAG_PIN, INPUT); // StallGuard DIAG pin (open-drain from TMC2209)
+
+  // Initialize joystick pins
+  pinMode(JOYSTICK_VRX, INPUT);
+  pinMode(JOYSTICK_SW, INPUT_PULLUP); // Use internal pull-up for button
+  Serial.println(F("[HW] Joystick initialized on A0 and D2"));
+
+  // IMPORTANT: Enable driver in hardware BEFORE UART communication
+  digitalWrite(ENABLE_PIN, LOW); // Enable driver (active LOW)
+  Serial.println(F("[HW] Driver ON"));
+
+  // Initialize AccelStepper
+  // Using safe, reliable speeds per AccelStepper manual (max 1000 steps/s)
+  stepper.setMaxSpeed(1000.0);     // Safe reliable speed (per manual)
+  stepper.setAcceleration(2000.0); // Conservative acceleration (2x speed)
+  stepper.setCurrentPosition(0);   // Set current position as zero
+  Serial.print(F("[ACCEL] MaxSpd="));
+  Serial.print(stepper.maxSpeed());
+  Serial.print(F(" Accel="));
+  Serial.print(stepper.acceleration());
+  Serial.print(F(" Steps/rev="));
+  Serial.println(TOTAL_STEPS);
+
+  // Check initial DIAG pin state
+  Serial.print(F("[HW] DIAG initial="));
+  Serial.println(digitalRead(DIAG_PIN));
+
+  // DON'T attach interrupt yet - wait until homing starts
+  // attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallInterruptHandler, RISING);
+  Serial.println(F("[HW] INT will attach in homeX"));
+
+  // Blink LED 3 times on startup
+  for (int i = 0; i < 3; i++)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+
+  // Initialize TMC2209 UART communication
+  Serial.println(F("\n[TMC] Init UART"));
+  SoftSerial.begin(115200);
+  TMC_Driver.beginSerial(115200);
+  delay(100);
+
+  // Configure TMC2209
+  TMC_Driver.begin();
+  TMC_Driver.toff(TOFF_VALUE);
+  TMC_Driver.blank_time(24);
+  TMC_Driver.rms_current(RUN_CURRENT);
+  TMC_Driver.microsteps(MICROSTEPS);
+
+  // IMPORTANT: Enable SpreadCycle for StallGuard to work
+  // StallGuard does NOT work in StealthChop mode!
+  // TMC_Driver.en_spreadCycle(true); // Enable SpreadCycle (required for StallGuard)
+  TMC_Driver.pwm_autoscale(true);
+
+  // Test UART communication
+  Serial.print(F("[TMC] UART: "));
+  uint32_t drv_status = TMC_Driver.DRV_STATUS();
+  if (drv_status == 0 || drv_status == 0xFFFFFFFF)
+  {
+    Serial.println(F("FAIL"));
+    Serial.println(F("  Chk pins 7,8->PDN"));
+  }
+  else
+  {
+    Serial.print(F("OK 0x"));
+    Serial.println(drv_status, HEX);
+  }
+
+  // Configure StallGuard for sensorless homing
+  TMC_Driver.TCOOLTHRS(0xFFFFF);
+  TMC_Driver.semin(0);
+  TMC_Driver.semax(2);
+  TMC_Driver.sedn(0b01);
+  TMC_Driver.SGTHRS(STALL_VALUE);
+
+  Serial.print(F("[TMC] I="));
+  Serial.print(RUN_CURRENT);
+  Serial.print(F("mA uStep="));
+  Serial.print(MICROSTEPS);
+  Serial.print(F(" SG="));
+  Serial.println(STALL_VALUE);
+
+  // Verify StallGuard configuration
+  Serial.print(F("[TMC] SGTHRS read="));
+  Serial.print(TMC_Driver.SGTHRS());
+  Serial.print(F(" TCOOLTHRS=0x"));
+  Serial.print(TMC_Driver.TCOOLTHRS(), HEX);
+  Serial.print(F(" SpreadCycle="));
+  Serial.println(TMC_Driver.en_spreadCycle() ? F("ON") : F("OFF"));
+
+  // Initialize I2C
+  Serial.println(F("[I2C] Init A4/A5"));
+  Wire.begin();
+  Wire.setClock(100000);
+
+  // Recover I2C bus
+  for (int i = 0; i < 10; i++)
+  {
+    Wire.beginTransmission(0x36);
+    Wire.endTransmission();
+    delay(10);
+  }
+
+  // Test AS5600
+  Wire.beginTransmission(0x36);
+  if (Wire.endTransmission() == 0)
+  {
+    Serial.print(F("[AS5600] "));
+    encoder.begin();
+    delay(100);
+
+    if (encoder.detectMagnet())
     {
-      Serial.print("HOMING: First limit detected! I=");
-      Serial.print(currentReading);
-      Serial.println("mA");
-
-      // Stop motor
-      TMC_Driver.VACTUAL(0);
-      delay(2000); // Wait longer for motor to fully stop and current to drop
-
-      // Record first position
-      firstLimitPosition = virtualPosition;
-
-      // Back off from the limit first
-      Serial.println("HOMING: Backing off from first limit...");
-      TMC_Driver.VACTUAL(-HOMING_SPEED);
-      delay(2000); // Move away for 2 seconds
-      virtualPosition -= (HOMING_SPEED / 1000) * 2; // Update position estimate
-
-      // Stop and wait
-      TMC_Driver.VACTUAL(0);
-      delay(2000); // Second delay before starting backward homing
-
-      // Start moving backward to find second limit
-      homingState = HOMING_BACKWARD;
-      stallConfirmCount = 0; // Reset stall counter for backward direction
-      TMC_Driver.VACTUAL(-HOMING_SPEED);
-      Serial.println("HOMING: Moving backward to find second limit...");
-    }
-    else
-    {
-      // Continue tracking position
-      virtualPosition += HOMING_SPEED / 1000; // Rough position estimate
-    }
-    break;
-
-  case HOMING_BACKWARD:
-    // Check for stall in backward direction
-    if (stallDetected)
-    {
-      Serial.print("HOMING: Second limit detected! I=");
-      Serial.print(currentReading);
-      Serial.println("mA");
-
-      // Stop motor
-      TMC_Driver.VACTUAL(0);
-      delay(2000);
-
-      // Record second position
-      secondLimitPosition = virtualPosition;
-
-      // Calculate travel range and center position
-      int32_t travelRange = abs(firstLimitPosition - secondLimitPosition);
-      int32_t centerPosition = (firstLimitPosition + secondLimitPosition) / 2;
-
-      Serial.println("HOMING: Both limits found!");
-      Serial.print("  First limit: ");
-      Serial.println(firstLimitPosition);
-      Serial.print("  Second limit: ");
-      Serial.println(secondLimitPosition);
-      Serial.print("  Travel range: ");
-      Serial.println(travelRange);
-      Serial.print("  Center position: ");
-      Serial.println(centerPosition);
-      Serial.println("HOMING: Moving to center position...");
-
-      // Determine direction to center
-      int32_t distanceToCenter = centerPosition - virtualPosition;
-      int32_t centerSpeed = (distanceToCenter > 0) ? HOMING_SPEED : -HOMING_SPEED;
-
-      homingState = HOMING_TO_CENTER;
-      stallConfirmCount = 0; // Reset stall counter
-      TMC_Driver.VACTUAL(centerSpeed);
-    }
-    else
-    {
-      // Continue tracking position
-      virtualPosition -= HOMING_SPEED / 1000; // Rough position estimate
-    }
-    break;
-
-  case HOMING_TO_CENTER:
-    // Move to center position
-    {
-      int32_t centerPosition = (firstLimitPosition + secondLimitPosition) / 2;
-      int32_t distanceToCenter = abs(centerPosition - virtualPosition);
-
-      // Check if we've reached the center (within tolerance)
-      if (distanceToCenter < 100) // Tolerance value
-      {
-        Serial.println("HOMING: Center position reached!");
-        TMC_Driver.VACTUAL(0);
-        homingState = HOMING_COMPLETE;
-        Serial.println("HOMING: Complete!");
-      }
+      if (encoder.magnetTooStrong())
+        Serial.println(F("Strong!"));
+      else if (encoder.magnetTooWeak())
+        Serial.println(F("Weak!"));
       else
-      {
-        // Continue tracking position
-        if (TMC_Driver.VACTUAL() > 0)
-        {
-          virtualPosition += HOMING_SPEED / 1000;
-        }
-        else
-        {
-          virtualPosition -= HOMING_SPEED / 1000;
-        }
-      }
+        Serial.println(F("OK"));
     }
-    break;
-
-  case HOMING_COMPLETE:
-    // Homing done - just monitor status
-    // Could add joystick control here if desired
-    break;
-
-  case HOMING_IDLE:
-  default:
-    break;
+    else
+      Serial.println(F("No mag!"));
   }
+  else
+    Serial.println(F("[AS5600] Not found"));
 
-  // Handle serial commands for manual control after homing
-  while (Serial.available() > 0)
+  // Initialize button state
+  button.currentState = false;
+  button.lastState = false;
+  button.pressStartTime = 0;
+  button.releaseTime = 0;
+  button.isPressed = false;
+  button.longPressTriggered = false;
+
+  // Initialize encoder calibration
+  encoderCal.isCalibrated = false;
+  encoderCal.stepsPerEncoderUnit = 0.0;
+
+  // Initialize markers
+  clearMarkers();
+
+  Serial.println(F("\n--- Ready ---"));
+  Serial.println(F("Homing on startup..."));
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+void loop()
+{
+  // Update encoder state (detects zero crossings)
+  encoder.update();
+
+  // Update button (check for short/long press events)
+  uint8_t buttonEvent = updateButton();
+
+  // State machine
+  switch (currentState)
   {
-    int8_t read_byte = Serial.read();
+  case STATE_STARTUP:
+    handleStartupState();
+    break;
 
-    if (read_byte == 'r' || read_byte == 'R') // Restart homing
-    {
-      Serial.println("Restarting homing sequence...");
-      virtualPosition = 0;
-      firstLimitPosition = 0;
-      secondLimitPosition = 0;
-      homingState = HOMING_FORWARD;
-      TMC_Driver.VACTUAL(HOMING_SPEED);
-    }
-    else if (read_byte == '0') // Stop motor
-    {
-      Serial.println("Motor stopped.");
-      TMC_Driver.VACTUAL(0);
-      homingState = HOMING_IDLE;
-    }
+  case STATE_READY:
+    handleReadyState(buttonEvent);
+    break;
+
+  case STATE_DISABLED:
+    handleDisabledState(buttonEvent);
+    break;
+
+  case STATE_PLAYBACK_DELAY:
+    handlePlaybackDelayState();
+    break;
+
+  case STATE_PLAYBACK:
+    handlePlaybackState();
+    break;
   }
 
-  // Print status every 100ms
-  if ((ms - last_time) > 100)
+  // Run stepper (except when disabled or waiting for playback)
+  if (currentState != STATE_DISABLED &&
+      currentState != STATE_PLAYBACK_DELAY)
   {
-    last_time = ms;
-
-    // Print current status
-    Serial.print("Status: SG=");
-    Serial.print(sgResult, DEC);
-    Serial.print(" STALL=");
-    Serial.print(stallDetected ? 1 : 0, DEC);
-    Serial.print(" DIAG=");
-    Serial.print(diagPin, DEC);
-    Serial.print(" I=");
-    Serial.print(currentReading, DEC);
-    Serial.print("mA");
-
-    // Add state info
-    Serial.print(" State=");
-    switch (homingState)
-    {
-    case HOMING_IDLE:
-      Serial.print("IDLE");
-      break;
-    case HOMING_FORWARD:
-      Serial.print("FWD");
-      break;
-    case HOMING_BACKWARD:
-      Serial.print("BACK");
-      break;
-    case HOMING_TO_CENTER:
-      Serial.print("CENTER");
-      break;
-    case HOMING_COMPLETE:
-      Serial.print("DONE");
-      break;
-    }
-
-    Serial.print(" Pos=");
-    Serial.println(virtualPosition);
+    stepper.run();
   }
-
-} // end loop
-
-// void setup()
-// {
-//   Serial.begin(9600);
-//   delay(500);
-
-//   // Initialize LED
-//   pinMode(LED_PIN, OUTPUT);
-//   digitalWrite(LED_PIN, LOW);
-
-//   // Initialize joystick pins
-//   pinMode(JOYSTICK_VRX, INPUT);
-//   pinMode(JOYSTICK_SW, INPUT_PULLUP); // Use internal pull-up for button
-
-//   // Initialize motor pins
-//   pinMode(ENABLE_PIN, OUTPUT);
-//   digitalWrite(ENABLE_PIN, LOW); // Enable driver BEFORE UART config (active LOW)
-
-//   Serial.println("IMPORTANT: Ensure TMC2209 VIO pin is connected to Arduino 5V!");
-//   delay(500);
-
-//   // Initialize TMC2209 UART communication
-//   softSerial.begin(115200);
-//   driver.begin();
-//   delay(50); // Allow driver to initialize
-
-//   // Test UART connection
-//   Serial.print("TMC2209 UART test: ");
-//   uint8_t result = driver.test_connection();
-//   if (result == 0) {
-//     Serial.println("FAILED - Check wiring!");
-//     Serial.println("  - RX (pin 7) via 1k resistor to PDN_UART");
-//     Serial.println("  - TX (pin 8) to PDN_UART");
-//     Serial.println("  - VIO to 5V, GND to GND");
-//   } else {
-//     Serial.println("OK");
-//   }
-//   delay(50);
-
-//   // Configure TMC2209
-//   Serial.println("Configuring TMC2209...");
-//   driver.toff(5);                    // Enable driver in software (TOFF > 0)
-//   delay(10);
-//   driver.rms_current(RUN_CURRENT);   // Set motor RMS current in mA
-//   delay(10);
-//   driver.microsteps(MICROSTEPS);     // Set microsteps
-//   delay(10);
-//   driver.en_spreadCycle(false);      // Disable spreadCycle (use StealthChop for quiet operation)
-//   delay(10);
-//   driver.pwm_autoscale(true);        // Enable automatic current scaling
-//   delay(10);
-//   driver.TCOOLTHRS(0xFFFFF);         // Enable CoolStep (optional, for efficiency)
-//   delay(10);
-
-//   // Read back and verify configuration
-//   Serial.print("  GCONF: 0x");
-//   Serial.println(driver.GCONF(), HEX);
-//   Serial.print("  Microsteps: ");
-//   Serial.println(driver.microsteps());
-//   Serial.print("  RMS Current: ");
-//   Serial.print(driver.rms_current());
-//   Serial.println(" mA");
-//   Serial.print("  DRV_STATUS: 0x");
-//   Serial.println(driver.DRV_STATUS(), HEX);
-
-//   Serial.println("TMC2209 initialized");
-//   delay(100);
-
-//   stepper.setMaxSpeed(MAX_SPEED);
-//   stepper.setAcceleration(ACCELERATION);
-//   stepper.setCurrentPosition(0);
-
-//   // Debug mode: Move 16 steps right, then 16 steps left
-//   Serial.println("DEBUG: Moving 16 steps right...");
-//   stepper.moveTo(16);
-//   while (stepper.distanceToGo() != 0)
-//   {
-//     stepper.run();
-//   }
-//   delay(500);
-
-//   Serial.println("DEBUG: Moving 16 steps left...");
-//   stepper.moveTo(-16);
-//   while (stepper.distanceToGo() != 0)
-//   {
-//     stepper.run();
-//   }
-//   delay(500);
-
-//   Serial.println("DEBUG: Returning to zero...");
-//   stepper.moveTo(0);
-//   while (stepper.distanceToGo() != 0)
-//   {
-//     stepper.run();
-//   }
-//   delay(500);
-
-//   Serial.println("DEBUG: Complete!");
-//   stepper.setCurrentPosition(0); // Reset position to zero after debug
-
-//   Serial.println("HOMING: 1.Move to 1st limit, click. 2.Move to 2nd limit, click.");
-//   Serial.println("Controls: Small deflection=half speed, Large=full speed");
-
-//   // Initialize I2C (Wire library)
-//   Wire.begin();
-
-//   // Initialize AS5600 encoder
-//   encoder.begin(4); // 4 = default I2C direction mode
-
-//   // Check if AS5600 is connected
-//   if (encoder.isConnected())
-//   {
-//     Serial.println("AS5600 OK");
-//     // Flash LED 3 times
-//     for (int i = 0; i < 3; i++)
-//     {
-//       digitalWrite(LED_PIN, HIGH);
-//       delay(100);
-//       digitalWrite(LED_PIN, LOW);
-//       delay(100);
-//     }
-//   }
-//   else
-//   {
-//     Serial.println("AS5600 ERROR - check wiring");
-//     // Flash LED rapidly
-//     while (1)
-//     {
-//       digitalWrite(LED_PIN, HIGH);
-//       delay(50);
-//       digitalWrite(LED_PIN, LOW);
-//       delay(50);
-//     }
-//   }
-
-//   if (encoder.magnetTooStrong())
-//     Serial.println("Mag: too close");
-//   else if (encoder.magnetTooWeak())
-//     Serial.println("Mag: too far");
-//   else if (encoder.detectMagnet())
-//     Serial.println("Mag: OK");
-//   else
-//     Serial.println("Mag: none");
-
-//   Serial.println("Ready");
-//   delay(500);
-// }
-
-// void loop()
-// {
-//   // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
-//   // This handles acceleration, deceleration, and stepping
-//   // stepper.run();
-
-//   // Update encoder state (detects rotation crossings)
-//   encoder.update();
-
-//   // Read joystick VRX (X-axis)
-//   int vrxValue = analogRead(JOYSTICK_VRX);
-
-//   // Read joystick button (active LOW)
-//   bool buttonPressed = (digitalRead(JOYSTICK_SW) == LOW);
-
-//   // Handle button press for homing sequence
-//   static bool lastButtonState = false;
-//   if (buttonPressed && !lastButtonState)
-//   {
-//     long currentPosition = stepper.currentPosition();
-
-//     switch (homingState)
-//     {
-//     case UNHOMED:
-//       firstLimitPosition = currentPosition;
-//       homingState = HOMING_FIRST_LIMIT;
-//       Serial.print("L1:");
-//       Serial.println(firstLimitPosition);
-//       break;
-
-//     case HOMING_FIRST_LIMIT:
-//       secondLimitPosition = currentPosition;
-//       if (firstLimitPosition < secondLimitPosition)
-//       {
-//         minLimit = firstLimitPosition;
-//         maxLimit = secondLimitPosition;
-//       }
-//       else
-//       {
-//         minLimit = secondLimitPosition;
-//         maxLimit = firstLimitPosition;
-//       }
-//       homingState = HOMED;
-//       Serial.print("L2:");
-//       Serial.print(secondLimitPosition);
-//       Serial.print(" R:");
-//       Serial.println(maxLimit - minLimit);
-//       break;
-
-//     case HOMED:
-//       homingState = UNHOMED;
-//       Serial.println("Rehome");
-//       break;
-//     }
-//   }
-//   lastButtonState = buttonPressed;
-
-//   // Motor control - different modes for homing vs homed
-//   if (homingState == HOMED)
-//   {
-//     // HOMED: Use moveTo/run for acceleration control
-//     long currentPos = stepper.currentPosition();
-//     long targetPosition;
-//     float maxSpeedSetting;
-
-//     if (abs(vrxValue - JOYSTICK_CENTER) > JOYSTICK_DEADZONE)
-//     {
-//       // Joystick is deflected - determine speed and direction
-//       int deflection = abs(vrxValue - JOYSTICK_CENTER);
-
-//       // Set max speed based on deflection
-//       if (deflection > JOYSTICK_HALF_THRESHOLD)
-//         maxSpeedSetting = MAX_SPEED;
-//       else
-//         maxSpeedSetting = HALF_SPEED;
-
-//       // Calculate target position far in the direction of movement
-//       if (vrxValue > JOYSTICK_CENTER + JOYSTICK_DEADZONE)
-//       {
-//         // Forward - set target to max limit
-//         targetPosition = maxLimit;
-//       }
-//       else
-//       {
-//         // Backward - set target to min limit
-//         targetPosition = minLimit;
-//       }
-//     }
-//     else
-//     {
-//       // Joystick centered - stop at current position with deceleration
-//       targetPosition = currentPos;
-//       maxSpeedSetting = MAX_SPEED;
-//     }
-
-//     // Apply settings and move
-//     stepper.setMaxSpeed(maxSpeedSetting);
-//     stepper.moveTo(targetPosition);
-//     stepper.run();
-//   }
-//   else
-//   {
-//     // NOT HOMED: Use setSpeed/runSpeed for continuous motion during homing
-//     float targetSpeed = 0.0;
-
-//     if (abs(vrxValue - JOYSTICK_CENTER) > JOYSTICK_DEADZONE)
-//     {
-//       // Joystick is deflected - determine speed and direction
-//       int deflection = abs(vrxValue - JOYSTICK_CENTER);
-
-//       // Set speed based on deflection
-//       float speedStep;
-//       if (deflection > JOYSTICK_HALF_THRESHOLD)
-//         speedStep = MAX_SPEED;
-//       else
-//         speedStep = HALF_SPEED;
-
-//       // Apply direction
-//       if (vrxValue > JOYSTICK_CENTER + JOYSTICK_DEADZONE)
-//         targetSpeed = speedStep; // Forward
-//       else
-//         targetSpeed = -speedStep; // Backward
-//     }
-
-//     // Apply speed
-//     stepper.setSpeed(targetSpeed);
-//     stepper.runSpeed();
-//   }
-
-//   // Print encoder and motor data every 100ms (non-blocking)
-//   static unsigned long lastPrint = 0;
-//   if (ENABLE_SERIAL_PRINT && (millis() - lastPrint >= 100))
-//   {
-//     lastPrint = millis();
-
-//     // Get encoder readings
-//     uint16_t rawAngle = encoder.getRawAngle();
-//     float degrees = encoder.getDegrees();
-//     long rotationCount = encoder.getRotationCount();
-
-//     // Get motor status
-//     long motorPosition = stepper.currentPosition();
-
-//     // Print formatted output
-//     Serial.print("State: ");
-//     switch (homingState)
-//     {
-//     case UNHOMED:
-//       Serial.print("UNHOMED");
-//       break;
-//     case HOMING_FIRST_LIMIT:
-//       Serial.print("HOMING");
-//       break;
-//     case HOMED:
-//       Serial.print("HOMED");
-//       break;
-//     }
-//     Serial.print(" | VRX:");
-//     Serial.print(vrxValue);
-//     Serial.print(" | Pos:");
-//     Serial.print(motorPosition);
-//     Serial.print(" | Spd:");
-//     Serial.print(stepper.speed(), 0);
-
-//     if (homingState == HOMED)
-//     {
-//       Serial.print(" | Lim:[");
-//       Serial.print(minLimit);
-//       Serial.print(",");
-//       Serial.print(maxLimit);
-//       Serial.print("]");
-//     }
-
-//     Serial.print(" | Enc:");
-//     Serial.print(rawAngle);
-//     Serial.println();
-//   }
-
-//   // Blink LED based on encoder position (always active)
-//   uint16_t rawAngle = encoder.getRawAngle();
-//   if (rawAngle < 100) // Near zero position
-//   {
-//     digitalWrite(LED_PIN, HIGH);
-//   }
-//   else
-//   {
-//     digitalWrite(LED_PIN, LOW);
-//   }
-// }
+}
