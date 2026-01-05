@@ -97,6 +97,10 @@
 #define I2C_SDA_PIN A4 // Analog pin A4 - I2C SDA (FIXED on Uno)
 #define I2C_SCL_PIN A5 // Analog pin A5 - I2C SCL (FIXED on Uno)
 
+// Joystick pins
+#define JOYSTICK_VRX A0 // Analog pin A0 - Joystick X-axis (VRx)
+#define JOYSTICK_SW 2   // Digital pin 2 - Joystick button (INT0, interrupt-capable)
+
 // ============================================================================
 // MOTOR & TMC2209 CONFIGURATION
 // ============================================================================
@@ -121,6 +125,13 @@
 
 // Movement parameters
 #define HOMING_BACKOFF_STEPS 500 // Steps to back off after hitting stall
+
+// Joystick parameters
+#define JOYSTICK_CENTER 512         // Center position (ADC value 0-1023)
+#define JOYSTICK_DEADZONE 50        // Deadzone around center (prevents drift)
+#define JOYSTICK_HALF_THRESHOLD 150 // Threshold for half vs full speed
+#define JOYSTICK_MIN 0              // Minimum ADC value
+#define JOYSTICK_MAX 800            // Maximum ADC value
 
 // ============================================================================
 // GLOBAL OBJECTS
@@ -297,7 +308,7 @@ void homeX()
   stallDetected = false;
 
   // STEP 1: Find first limit (negative direction)
-  moveUntilStall(-HOMING_SPEED, "Step 1");
+  moveUntilStall(-HOMING_SPEED, "Step 1", 50);
 
   firstLimitPosition = 0;
   stepper.setCurrentPosition(0);
@@ -393,15 +404,20 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   pinMode(DIAG_PIN, INPUT); // StallGuard DIAG pin (open-drain from TMC2209)
 
+  // Initialize joystick pins
+  pinMode(JOYSTICK_VRX, INPUT);
+  pinMode(JOYSTICK_SW, INPUT_PULLUP); // Use internal pull-up for button
+  Serial.println(F("[HW] Joystick initialized on A0 and D2"));
+
   // IMPORTANT: Enable driver in hardware BEFORE UART communication
   digitalWrite(ENABLE_PIN, LOW); // Enable driver (active LOW)
   Serial.println(F("[HW] Driver ON"));
 
   // Initialize AccelStepper
   // Using safe, reliable speeds per AccelStepper manual (max 1000 steps/s)
-  stepper.setMaxSpeed(1000.0);      // Safe reliable speed (per manual)
-  stepper.setAcceleration(2000.0);   // Conservative acceleration (2x speed)
-  stepper.setCurrentPosition(0);     // Set current position as zero
+  stepper.setMaxSpeed(1000.0);     // Safe reliable speed (per manual)
+  stepper.setAcceleration(2000.0); // Conservative acceleration (2x speed)
+  stepper.setCurrentPosition(0);   // Set current position as zero
   Serial.print(F("[ACCEL] MaxSpd="));
   Serial.print(stepper.maxSpeed());
   Serial.print(F(" Accel="));
@@ -526,19 +542,94 @@ void setup()
 
 void loop()
 {
+  // Run homing sequence on startup
   if (startup)
   {
     startup = false;
     homeX();
   }
-  // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
-  // This handles acceleration, deceleration, and stepping
-  stepper.run();
 
   // Update encoder state (detects zero crossings)
   encoder.update();
 
   // ============================================================================
-  // STARTUP HOMING
+  // JOYSTICK CONTROL (after homing)
   // ============================================================================
+
+  // if (isHomed)
+  // {
+  //   // Read joystick VRX (X-axis)
+  //   int vrxValue = analogRead(JOYSTICK_VRX);
+
+  //   // Motor control - use moveTo/run for acceleration control
+  //   long currentPos = stepper.currentPosition();
+  //   long targetPosition;
+  //   float maxSpeedSetting;
+
+  //   if (abs(vrxValue - JOYSTICK_CENTER) > JOYSTICK_DEADZONE)
+  //   {
+  //     // Joystick is deflected - determine speed and direction
+  //     int deflection = abs(vrxValue - JOYSTICK_CENTER);
+
+  //     // Set max speed based on deflection
+  //     if (deflection > JOYSTICK_HALF_THRESHOLD)
+  //       maxSpeedSetting = MAX_SPEED;
+  //     else
+  //       maxSpeedSetting = MAX_SPEED / 2.0; // Half speed
+
+  //     // Calculate target position far in the direction of movement
+  //     if (vrxValue > JOYSTICK_CENTER + JOYSTICK_DEADZONE)
+  //     {
+  //       // Forward - set target to max limit
+  //       targetPosition = maxLimit;
+  //     }
+  //     else
+  //     {
+  //       // Backward - set target to min limit
+  //       targetPosition = minLimit;
+  //     }
+  //   }
+  //   else
+  //   {
+  //     // Joystick centered - stop at current position with deceleration
+  //     targetPosition = currentPos;
+  //     maxSpeedSetting = MAX_SPEED;
+  //   }
+
+  //   // Apply settings and move
+  //   stepper.setMaxSpeed(maxSpeedSetting);
+  //   stepper.moveTo(targetPosition);
+  // }
+
+  // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
+  // This handles acceleration, deceleration, and stepping
+  stepper.run();
+
+  // ============================================================================
+  // SERIAL PRINTING (every PRINT_INTERVAL ms)
+  // ============================================================================
+
+  // unsigned long currentTime = millis();
+  // if (isHomed && (currentTime - lastPrintTime >= PRINT_INTERVAL))
+  // {
+  //   lastPrintTime = currentTime;
+
+  //   // Read joystick value for display
+  //   int vrxValue = analogRead(JOYSTICK_VRX);
+
+  //   // Print formatted output
+  //   Serial.print(F("VRX:"));
+  //   Serial.print(vrxValue);
+  //   Serial.print(F(" | Pos:"));
+  //   Serial.print(stepper.currentPosition());
+  //   Serial.print(F(" | Spd:"));
+  //   Serial.print(stepper.speed(), 0);
+  //   Serial.print(F(" | Lim:["));
+  //   Serial.print(minLimit);
+  //   Serial.print(F(","));
+  //   Serial.print(maxLimit);
+  //   Serial.print(F("] | Enc:"));
+  //   Serial.print(encoder.getRawAngle());
+  //   Serial.println();
+  // }
 }
