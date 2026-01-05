@@ -125,6 +125,7 @@
 
 // Movement parameters
 #define HOMING_BACKOFF_STEPS 500 // Steps to back off after hitting stall
+#define SAFETY_BUFFER_STEPS 50   // Safety buffer from hard limits (microsteps)
 
 // Joystick parameters
 #define JOYSTICK_CENTER 512         // Center position (ADC value 0-1023)
@@ -156,19 +157,99 @@ EncoderReader encoder;
 
 volatile bool stallDetected = false; // Flag set by interrupt
 bool shaftVal = false;               // Direction: false = forward, true = reverse
-bool startup = true;                 // Run homing on startup
 
 // Homing limit positions
 long firstLimitPosition = 0;
 long secondLimitPosition = 0;
 long minLimit = 0;
 long maxLimit = 0;
+long safeMinLimit = 0;  // Min limit + safety buffer
+long safeMaxLimit = 0;  // Max limit - safety buffer
 long centerPosition = 0;
 bool isHomed = false;
 
 // Update interval for serial output (milliseconds)
 const unsigned long PRINT_INTERVAL = 100; // 10Hz update rate
 unsigned long lastPrintTime = 0;
+
+// ============================================================================
+// POSITION MARKER SYSTEM - DATA STRUCTURES
+// ============================================================================
+
+// System states
+enum SystemState
+{
+  STATE_STARTUP,        // Before homing
+  STATE_READY,          // Normal operation
+  STATE_DISABLED,       // Motor disabled for manual positioning
+  STATE_PLAYBACK_DELAY, // 5-second countdown
+  STATE_PLAYBACK        // Executing playback sequence
+};
+
+// Encoder calibration (captured during homing)
+struct EncoderCalibration
+{
+  long minLimitRotations;
+  uint16_t minLimitRawAngle;
+  long minLimitStepperPos;
+  long maxLimitRotations;
+  uint16_t maxLimitRawAngle;
+  long maxLimitStepperPos;
+  float stepsPerEncoderUnit;
+  float encoderRotationsPerStepperRotation;  // Gear ratio for rotation-based conversion
+  bool isCalibrated;
+};
+
+// Position markers (encoder readings)
+struct PositionMarker
+{
+  long rotationCount;
+  uint16_t rawAngle;
+  bool isSet;
+};
+
+// Button state tracking
+struct ButtonState
+{
+  bool currentState;
+  bool lastState;
+  unsigned long pressStartTime;
+  unsigned long releaseTime;
+  bool isPressed;
+  bool longPressTriggered;
+};
+
+// Playback sequence state
+struct PlaybackState
+{
+  uint8_t currentMarkerIndex;
+  unsigned long delayStartTime;
+  unsigned long pauseStartTime;
+  bool movingToStart;
+  bool isComplete;
+};
+
+// Constants
+const uint8_t MAX_MARKERS = 3;
+const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long LONG_PRESS_TIME = 2000;
+const unsigned long SHORT_PRESS_MAX = 500;
+const unsigned long PLAYBACK_DELAY_MS = 5000;
+const unsigned long MARKER_PAUSE_MS = 500;
+
+// Globals
+SystemState currentState = STATE_STARTUP;
+EncoderCalibration encoderCal;
+PositionMarker markers[MAX_MARKERS];
+uint8_t markerCount = 0;
+ButtonState button;
+PlaybackState playback;
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+long encoderToStepperPosition(long rotationCount, uint16_t rawAngle);
 
 // ============================================================================
 // INTERRUPT SERVICE ROUTINE - StallGuard Detection
@@ -308,12 +389,26 @@ void homeX()
   stallDetected = false;
 
   // STEP 1: Find first limit (negative direction)
-  moveUntilStall(-HOMING_SPEED, "Step 1", 50);
+  moveUntilStall(-HOMING_SPEED, "Step 1", 100);
 
   firstLimitPosition = 0;
   stepper.setCurrentPosition(0);
+
+  // CRITICAL: Reset encoder to create consistent reference frame
+  encoder.setRotationCount(0);
+  Serial.println(F("[Step 1] Encoder rotation count reset to 0"));
+
   Serial.print(F("[Step 1] First limit set at position: "));
   Serial.println(firstLimitPosition);
+
+  // Capture encoder position at first limit (min limit)
+  encoderCal.minLimitRotations = encoder.getRotationCount();
+  encoderCal.minLimitRawAngle = encoder.getRawAngle();
+  encoderCal.minLimitStepperPos = 0;
+  Serial.print(F("[Calibration] Min limit encoder: rot="));
+  Serial.print(encoderCal.minLimitRotations);
+  Serial.print(F(" raw="));
+  Serial.println(encoderCal.minLimitRawAngle);
 
   // STEP 2: Find second limit (positive direction)
   // Ignore first 100 steps to clear "hot" stall signal from Step 1
@@ -321,10 +416,23 @@ void homeX()
 
   secondLimitPosition = stepper.currentPosition();
 
+  // Capture encoder position at second limit (max limit)
+  encoderCal.maxLimitRotations = encoder.getRotationCount();
+  encoderCal.maxLimitRawAngle = encoder.getRawAngle();
+  encoderCal.maxLimitStepperPos = stepper.currentPosition();
+  Serial.print(F("[Calibration] Max limit encoder: rot="));
+  Serial.print(encoderCal.maxLimitRotations);
+  Serial.print(F(" raw="));
+  Serial.println(encoderCal.maxLimitRawAngle);
+
   // Calculate limits and center
   minLimit = (firstLimitPosition < secondLimitPosition) ? firstLimitPosition : secondLimitPosition;
   maxLimit = (firstLimitPosition < secondLimitPosition) ? secondLimitPosition : firstLimitPosition;
   centerPosition = (minLimit + maxLimit) / 2;
+
+  // Calculate safe limits with buffer
+  safeMinLimit = minLimit + SAFETY_BUFFER_STEPS;
+  safeMaxLimit = maxLimit - SAFETY_BUFFER_STEPS;
 
   Serial.println(F("\n=== HOMING RESULTS ==="));
   Serial.print(F("First limit:  "));
@@ -335,11 +443,64 @@ void homeX()
   Serial.println(minLimit);
   Serial.print(F("Max limit:    "));
   Serial.println(maxLimit);
+  Serial.print(F("Safe min:     "));
+  Serial.println(safeMinLimit);
+  Serial.print(F("Safe max:     "));
+  Serial.println(safeMaxLimit);
   Serial.print(F("Range:        "));
   Serial.print(maxLimit - minLimit);
   Serial.println(F(" steps"));
   Serial.print(F("Center:       "));
   Serial.println(centerPosition);
+
+  // Calculate encoder calibration using rotation-based math
+  float encoderMinRot = (float)encoderCal.minLimitRotations +
+                        (encoderCal.minLimitRawAngle / 4096.0);
+  float encoderMaxRot = (float)encoderCal.maxLimitRotations +
+                        (encoderCal.maxLimitRawAngle / 4096.0);
+  float encoderRotationRange = encoderMaxRot - encoderMinRot;
+
+  float stepperRotationRange = (maxLimit - minLimit) / (float)(STEPS_PER_REV * MICROSTEPS);
+
+  encoderCal.encoderRotationsPerStepperRotation = encoderRotationRange / stepperRotationRange;
+
+  // Keep legacy calculation for backward compatibility
+  long encoderMin = (encoderCal.minLimitRotations * 4096L) + encoderCal.minLimitRawAngle;
+  long encoderMax = (encoderCal.maxLimitRotations * 4096L) + encoderCal.maxLimitRawAngle;
+  long encoderRange = abs(encoderMax - encoderMin);
+  long stepperRange = maxLimit - minLimit;
+  encoderCal.stepsPerEncoderUnit = (float)stepperRange / (float)encoderRange;
+  encoderCal.isCalibrated = true;
+
+  Serial.println(F("\n=== ENCODER CALIBRATION ==="));
+  Serial.print(F("Encoder rotations: "));
+  Serial.println(encoderRotationRange, 6);
+  Serial.print(F("Stepper rotations: "));
+  Serial.println(stepperRotationRange, 6);
+  Serial.print(F("Encoder/Stepper ratio: "));
+  Serial.println(encoderCal.encoderRotationsPerStepperRotation, 6);
+  Serial.print(F("Steps/unit (legacy): "));
+  Serial.println(encoderCal.stepsPerEncoderUnit, 6);
+
+  // Verify calibration by converting limits back
+  long verifyMin = encoderToStepperPosition(
+      encoderCal.minLimitRotations,
+      encoderCal.minLimitRawAngle);
+  long verifyMax = encoderToStepperPosition(
+      encoderCal.maxLimitRotations,
+      encoderCal.maxLimitRawAngle);
+
+  Serial.println(F("\n=== CALIBRATION VERIFICATION ==="));
+  Serial.print(F("Min limit: "));
+  Serial.print(verifyMin);
+  Serial.print(F(" (expect ~"));
+  Serial.print(safeMinLimit);
+  Serial.println(F(")"));
+  Serial.print(F("Max limit: "));
+  Serial.print(verifyMax);
+  Serial.print(F(" (expect ~"));
+  Serial.print(safeMaxLimit);
+  Serial.println(F(")"));
 
   detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
   Serial.println(F("[Home] Interrupt detached"));
@@ -377,7 +538,374 @@ void homeX()
   Serial.println(F(" steps/s"));
 
   isHomed = true;
+  currentState = STATE_READY;
   Serial.println(F("\n=== HOMING COMPLETE ===\n"));
+}
+
+// ============================================================================
+// POSITION MARKER SYSTEM - HELPER FUNCTIONS
+// ============================================================================
+
+// Button handler (non-blocking)
+// Returns: 0 = no event, 1 = short press, 2 = long press
+uint8_t updateButton()
+{
+  uint8_t event = 0;
+  button.currentState = (digitalRead(JOYSTICK_SW) == LOW);
+  unsigned long currentTime = millis();
+
+  // Detect press with debouncing
+  if (button.currentState && !button.lastState)
+  {
+    if (currentTime - button.releaseTime > DEBOUNCE_DELAY)
+    {
+      button.pressStartTime = currentTime;
+      button.isPressed = true;
+      button.longPressTriggered = false;
+    }
+  }
+
+  // Detect long press while held
+  if (button.isPressed && !button.longPressTriggered)
+  {
+    if (currentTime - button.pressStartTime >= LONG_PRESS_TIME)
+    {
+      button.longPressTriggered = true;
+      event = 2; // Long press
+    }
+  }
+
+  // Detect release
+  if (!button.currentState && button.lastState)
+  {
+    if (currentTime - button.pressStartTime > DEBOUNCE_DELAY)
+    {
+      button.releaseTime = currentTime;
+      if (button.isPressed && !button.longPressTriggered)
+      {
+        unsigned long duration = currentTime - button.pressStartTime;
+        if (duration < SHORT_PRESS_MAX)
+        {
+          event = 1; // Short press
+        }
+      }
+      button.isPressed = false;
+    }
+  }
+
+  button.lastState = button.currentState;
+  return event;
+}
+
+// Convert encoder position to stepper position (rotation-based math)
+long encoderToStepperPosition(long rotationCount, uint16_t rawAngle)
+{
+  if (!encoderCal.isCalibrated)
+    return 0;
+
+  // Calculate encoder position in rotations (floating point precision)
+  float encoderRotations = (float)rotationCount + (rawAngle / 4096.0);
+  float encoderMinRotations = (float)encoderCal.minLimitRotations +
+                               (encoderCal.minLimitRawAngle / 4096.0);
+  float encoderRelativeRotations = encoderRotations - encoderMinRotations;
+
+  // Convert to stepper rotations, then to steps
+  float stepperRelativeRotations = encoderRelativeRotations /
+                                    encoderCal.encoderRotationsPerStepperRotation;
+  long stepperRelativeSteps = (long)(stepperRelativeRotations * STEPS_PER_REV * MICROSTEPS);
+  long stepperPos = encoderCal.minLimitStepperPos + stepperRelativeSteps;
+
+  // Clamp to safe range (with buffer)
+  if (stepperPos < safeMinLimit)
+    stepperPos = safeMinLimit;
+  if (stepperPos > safeMaxLimit)
+    stepperPos = safeMaxLimit;
+
+  return stepperPos;
+}
+
+// Save current encoder position as marker
+bool saveMarker()
+{
+  if (markerCount >= MAX_MARKERS)
+  {
+    Serial.println(F("[Marker] Already at max (3) markers!"));
+    return false;
+  }
+
+  long currentRotations = encoder.getRotationCount();
+  uint16_t currentRawAngle = encoder.getRawAngle();
+  long stepperPos = encoderToStepperPosition(currentRotations, currentRawAngle);
+
+  markers[markerCount].rotationCount = currentRotations;
+  markers[markerCount].rawAngle = currentRawAngle;
+  markers[markerCount].isSet = true;
+
+  Serial.print(F("[Marker] Saved #"));
+  Serial.print(markerCount + 1);
+  Serial.print(F(" at stepper pos: "));
+  Serial.println(stepperPos);
+
+  markerCount++;
+  return true;
+}
+
+// Clear all markers
+void clearMarkers()
+{
+  for (uint8_t i = 0; i < MAX_MARKERS; i++)
+  {
+    markers[i].isSet = false;
+  }
+  markerCount = 0;
+}
+
+// Determine which end position is closest to first marker
+long determineStartPosition()
+{
+  if (markerCount == 0)
+    return minLimit;
+
+  long firstMarkerPos = encoderToStepperPosition(
+      markers[0].rotationCount, markers[0].rawAngle);
+
+  long distToMin = abs(firstMarkerPos - minLimit);
+  long distToMax = abs(firstMarkerPos - maxLimit);
+
+  return (distToMin < distToMax) ? minLimit : maxLimit;
+}
+
+// Sort markers based on start position
+void sortMarkers(long startPosition)
+{
+  if (markerCount <= 1)
+    return;
+
+  long markerPositions[MAX_MARKERS];
+  for (uint8_t i = 0; i < markerCount; i++)
+  {
+    markerPositions[i] = encoderToStepperPosition(
+        markers[i].rotationCount, markers[i].rawAngle);
+  }
+
+  bool ascending = (startPosition == minLimit);
+  for (uint8_t i = 0; i < markerCount - 1; i++)
+  {
+    for (uint8_t j = 0; j < markerCount - i - 1; j++)
+    {
+      bool swap = ascending ? (markerPositions[j] > markerPositions[j + 1]) : (markerPositions[j] < markerPositions[j + 1]);
+
+      if (swap)
+      {
+        long tempPos = markerPositions[j];
+        markerPositions[j] = markerPositions[j + 1];
+        markerPositions[j + 1] = tempPos;
+
+        PositionMarker tempMarker = markers[j];
+        markers[j] = markers[j + 1];
+        markers[j + 1] = tempMarker;
+      }
+    }
+  }
+}
+
+// Sort markers by stepper position (ascending order)
+void sortMarkersByPosition()
+{
+  if (markerCount <= 1)
+    return;
+
+  // Bubble sort markers by stepper position (ascending)
+  for (uint8_t i = 0; i < markerCount - 1; i++)
+  {
+    for (uint8_t j = 0; j < markerCount - i - 1; j++)
+    {
+      long posJ = encoderToStepperPosition(markers[j].rotationCount, markers[j].rawAngle);
+      long posJplus1 = encoderToStepperPosition(markers[j + 1].rotationCount, markers[j + 1].rawAngle);
+
+      if (posJ > posJplus1)
+      {
+        PositionMarker temp = markers[j];
+        markers[j] = markers[j + 1];
+        markers[j + 1] = temp;
+      }
+    }
+  }
+
+  Serial.println(F("[Playback] Markers sorted by position:"));
+  for (uint8_t i = 0; i < markerCount; i++)
+  {
+    long pos = encoderToStepperPosition(markers[i].rotationCount, markers[i].rawAngle);
+    Serial.print(F("  Marker "));
+    Serial.print(i + 1);
+    Serial.print(F(": "));
+    Serial.println(pos);
+  }
+}
+
+// Initialize playback sequence
+void initializePlayback()
+{
+  // Sort markers by position (ascending order)
+  sortMarkersByPosition();
+
+  playback.currentMarkerIndex = 0;
+  playback.movingToStart = true; // Now means "moving to first marker"
+  playback.isComplete = false;
+
+  // Calculate first marker's stepper position
+  long firstMarkerPos = encoderToStepperPosition(
+      markers[0].rotationCount,
+      markers[0].rawAngle);
+
+  Serial.print(F("[Playback] Moving to first marker at stepper pos: "));
+  Serial.println(firstMarkerPos);
+  stepper.moveTo(firstMarkerPos);
+}
+
+// ============================================================================
+// POSITION MARKER SYSTEM - STATE HANDLERS
+// ============================================================================
+
+void handleStartupState()
+{
+  static bool homingStarted = false;
+  if (!homingStarted)
+  {
+    homingStarted = true;
+    homeX(); // Sets currentState = STATE_READY at end
+  }
+}
+
+void handleReadyState(uint8_t buttonEvent)
+{
+  if (buttonEvent == 2)
+  { // Long press
+    Serial.println(F("\n=== MOTOR DISABLED ==="));
+    Serial.println(F("Move motor manually to desired positions"));
+    Serial.println(F("SHORT press to save position (max 3)"));
+    Serial.println(F("LONG press to start playback sequence\n"));
+    digitalWrite(ENABLE_PIN, HIGH);
+    clearMarkers();
+    currentState = STATE_DISABLED;
+  }
+}
+
+void handleDisabledState(uint8_t buttonEvent)
+{
+  if (buttonEvent == 1)
+  { // Short press
+    saveMarker();
+  }
+  else if (buttonEvent == 2)
+  { // Long press
+    if (markerCount == 0)
+    {
+      Serial.println(F("[Error] No markers saved!"));
+      return;
+    }
+    Serial.println(F("\n=== STARTING PLAYBACK ==="));
+    playback.delayStartTime = millis();
+    currentState = STATE_PLAYBACK_DELAY;
+  }
+
+  // Display position periodically
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 200)
+  {
+    Serial.print(F("DISABLED - Enc: "));
+    Serial.print(encoder.getRotationCount());
+    Serial.print(F(":"));
+    Serial.print(encoder.getRawAngle());
+    Serial.print(F(" | Markers: "));
+    Serial.print(markerCount);
+    Serial.print(F("/"));
+    Serial.println(MAX_MARKERS);
+    lastPrint = millis();
+  }
+}
+
+void handlePlaybackDelayState()
+{
+  unsigned long elapsed = millis() - playback.delayStartTime;
+
+  static unsigned long lastCountdown = 0;
+  if (millis() - lastCountdown > 1000)
+  {
+    Serial.print(F("[Playback] Starting in "));
+    Serial.print((PLAYBACK_DELAY_MS - elapsed) / 1000);
+    Serial.println(F("s..."));
+    lastCountdown = millis();
+  }
+
+  if (elapsed >= PLAYBACK_DELAY_MS)
+  {
+    Serial.println(F("[Playback] BEGIN!"));
+    digitalWrite(ENABLE_PIN, LOW); // Enable motor
+    delay(100);
+    initializePlayback();
+    currentState = STATE_PLAYBACK;
+  }
+}
+
+void handlePlaybackState()
+{
+  if (stepper.distanceToGo() != 0)
+    return; // Still moving
+
+  if (playback.movingToStart)
+  {
+    // Arrived at first marker, start the sequence
+    Serial.println(F("[Playback] At first marker, starting sequence"));
+    playback.movingToStart = false;
+    playback.pauseStartTime = millis();
+    playback.currentMarkerIndex = 1; // Skip first marker (already there)
+    return;
+  }
+
+  if (playback.pauseStartTime > 0)
+  {
+    if (millis() - playback.pauseStartTime < MARKER_PAUSE_MS)
+    {
+      return; // Still pausing
+    }
+    playback.pauseStartTime = 0;
+  }
+
+  if (playback.currentMarkerIndex < markerCount)
+  {
+    long targetPos = encoderToStepperPosition(
+        markers[playback.currentMarkerIndex].rotationCount,
+        markers[playback.currentMarkerIndex].rawAngle);
+
+    Serial.print(F("[Playback] Marker #"));
+    Serial.println(playback.currentMarkerIndex + 1);
+    stepper.moveTo(targetPos);
+    playback.pauseStartTime = millis();
+    playback.currentMarkerIndex++;
+  }
+  else if (!playback.isComplete)
+  {
+    // Determine which end is furthest from last marker
+    long lastMarkerPos = encoderToStepperPosition(
+        markers[markerCount - 1].rotationCount,
+        markers[markerCount - 1].rawAngle);
+
+    long distToMin = abs(lastMarkerPos - safeMinLimit);
+    long distToMax = abs(lastMarkerPos - safeMaxLimit);
+    long endPos = (distToMin > distToMax) ? safeMinLimit : safeMaxLimit;
+
+    Serial.print(F("[Playback] Moving to opposite end: "));
+    Serial.println(endPos);
+    stepper.moveTo(endPos);
+    playback.isComplete = true;
+  }
+  else
+  {
+    Serial.println(F("\n=== PLAYBACK COMPLETE ==="));
+    currentState = STATE_READY;
+    clearMarkers();
+  }
 }
 
 // ============================================================================
@@ -532,6 +1060,21 @@ void setup()
   else
     Serial.println(F("[AS5600] Not found"));
 
+  // Initialize button state
+  button.currentState = false;
+  button.lastState = false;
+  button.pressStartTime = 0;
+  button.releaseTime = 0;
+  button.isPressed = false;
+  button.longPressTriggered = false;
+
+  // Initialize encoder calibration
+  encoderCal.isCalibrated = false;
+  encoderCal.stepsPerEncoderUnit = 0.0;
+
+  // Initialize markers
+  clearMarkers();
+
   Serial.println(F("\n--- Ready ---"));
   Serial.println(F("Homing on startup..."));
 }
@@ -542,94 +1085,40 @@ void setup()
 
 void loop()
 {
-  // Run homing sequence on startup
-  if (startup)
-  {
-    startup = false;
-    homeX();
-  }
-
   // Update encoder state (detects zero crossings)
   encoder.update();
 
-  // ============================================================================
-  // JOYSTICK CONTROL (after homing)
-  // ============================================================================
+  // Update button (check for short/long press events)
+  uint8_t buttonEvent = updateButton();
 
-  // if (isHomed)
-  // {
-  //   // Read joystick VRX (X-axis)
-  //   int vrxValue = analogRead(JOYSTICK_VRX);
+  // State machine
+  switch (currentState)
+  {
+  case STATE_STARTUP:
+    handleStartupState();
+    break;
 
-  //   // Motor control - use moveTo/run for acceleration control
-  //   long currentPos = stepper.currentPosition();
-  //   long targetPosition;
-  //   float maxSpeedSetting;
+  case STATE_READY:
+    handleReadyState(buttonEvent);
+    break;
 
-  //   if (abs(vrxValue - JOYSTICK_CENTER) > JOYSTICK_DEADZONE)
-  //   {
-  //     // Joystick is deflected - determine speed and direction
-  //     int deflection = abs(vrxValue - JOYSTICK_CENTER);
+  case STATE_DISABLED:
+    handleDisabledState(buttonEvent);
+    break;
 
-  //     // Set max speed based on deflection
-  //     if (deflection > JOYSTICK_HALF_THRESHOLD)
-  //       maxSpeedSetting = MAX_SPEED;
-  //     else
-  //       maxSpeedSetting = MAX_SPEED / 2.0; // Half speed
+  case STATE_PLAYBACK_DELAY:
+    handlePlaybackDelayState();
+    break;
 
-  //     // Calculate target position far in the direction of movement
-  //     if (vrxValue > JOYSTICK_CENTER + JOYSTICK_DEADZONE)
-  //     {
-  //       // Forward - set target to max limit
-  //       targetPosition = maxLimit;
-  //     }
-  //     else
-  //     {
-  //       // Backward - set target to min limit
-  //       targetPosition = minLimit;
-  //     }
-  //   }
-  //   else
-  //   {
-  //     // Joystick centered - stop at current position with deceleration
-  //     targetPosition = currentPos;
-  //     maxSpeedSetting = MAX_SPEED;
-  //   }
+  case STATE_PLAYBACK:
+    handlePlaybackState();
+    break;
+  }
 
-  //   // Apply settings and move
-  //   stepper.setMaxSpeed(maxSpeedSetting);
-  //   stepper.moveTo(targetPosition);
-  // }
-
-  // IMPORTANT: Must call stepper.run() regularly for AccelStepper to work!
-  // This handles acceleration, deceleration, and stepping
-  stepper.run();
-
-  // ============================================================================
-  // SERIAL PRINTING (every PRINT_INTERVAL ms)
-  // ============================================================================
-
-  // unsigned long currentTime = millis();
-  // if (isHomed && (currentTime - lastPrintTime >= PRINT_INTERVAL))
-  // {
-  //   lastPrintTime = currentTime;
-
-  //   // Read joystick value for display
-  //   int vrxValue = analogRead(JOYSTICK_VRX);
-
-  //   // Print formatted output
-  //   Serial.print(F("VRX:"));
-  //   Serial.print(vrxValue);
-  //   Serial.print(F(" | Pos:"));
-  //   Serial.print(stepper.currentPosition());
-  //   Serial.print(F(" | Spd:"));
-  //   Serial.print(stepper.speed(), 0);
-  //   Serial.print(F(" | Lim:["));
-  //   Serial.print(minLimit);
-  //   Serial.print(F(","));
-  //   Serial.print(maxLimit);
-  //   Serial.print(F("] | Enc:"));
-  //   Serial.print(encoder.getRawAngle());
-  //   Serial.println();
-  // }
+  // Run stepper (except when disabled or waiting for playback)
+  if (currentState != STATE_DISABLED &&
+      currentState != STATE_PLAYBACK_DELAY)
+  {
+    stepper.run();
+  }
 }
