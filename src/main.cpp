@@ -157,12 +157,9 @@
 // GLOBAL OBJECTS
 // ============================================================================
 
-// TMC2209 UART - Forward declare Serial stream (will use Serial2 on ESP32)
-// Serial2 will be initialized in setup() with begin(baud, config, rx, tx)
-Stream* TMCSerial_ptr = nullptr;
-
-// Create TMC2209 driver object (pointer will be set to Serial2 in setup)
-TMC2209Stepper TMC_Driver(TMCSerial_ptr, R_SENSE, DRIVER_ADDRESS);
+// TMC2209 driver object using ESP32's Serial2 (Hardware UART)
+// Serial2 is pre-defined on ESP32 and will be initialized in setup()
+TMC2209Stepper TMC_Driver(&Serial2, R_SENSE, DRIVER_ADDRESS);
 
 // Create AccelStepper object using DRIVER mode (step/direction interface)
 // AccelStepper stepper(interface, stepPin, directionPin)
@@ -993,8 +990,7 @@ void setup()
   // Initialize TMC2209 UART communication using ESP32 Serial2
   Serial.println(F("\n[TMC] Init UART"));
   Serial2.begin(115200, SERIAL_8N1, TMC_UART_RX, TMC_UART_TX);
-  TMCSerial_ptr = &Serial2;  // Point to Serial2 for TMC driver
-  TMC_Driver.beginSerial(115200);
+  // Note: beginSerial() not needed for hardware serial on ESP32
   delay(100);
 
   // Configure TMC2209
