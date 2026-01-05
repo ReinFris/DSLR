@@ -65,6 +65,9 @@ public:
   // Encoder conversion
   long encoderToStepperPosition(long rotationCount, uint16_t rawAngle);
 
+  // Position synchronization
+  bool syncStepperToEncoder();
+
   // Calibration accessor
   const EncoderCalibration &getCalibration() const { return _encoderCal; }
 

@@ -102,6 +102,7 @@ void StateMachine::handleDisabledState(uint8_t buttonEvent)
 {
   if (buttonEvent == 1)
   { // Short press
+    // Save current encoder position as marker
     _markerSystem.saveMarker();
   }
   else if (buttonEvent == 2)
@@ -120,10 +121,20 @@ void StateMachine::handleDisabledState(uint8_t buttonEvent)
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 200)
   {
+    long encoderRot = _encoder.getRotationCount();
+    uint16_t encoderAngle = _encoder.getRawAngle();
+    long calculatedStepperPos = _motorControl.encoderToStepperPosition(encoderRot, encoderAngle);
+    long currentStepperPos = _stepper.currentPosition();
+    long drift = currentStepperPos - calculatedStepperPos;
+
     Serial.print(F("DISABLED - Enc: "));
-    Serial.print(_encoder.getRotationCount());
+    Serial.print(encoderRot);
     Serial.print(F(":"));
-    Serial.print(_encoder.getRawAngle());
+    Serial.print(encoderAngle);
+    Serial.print(F(" | Stepper: "));
+    Serial.print(currentStepperPos);
+    Serial.print(F(" | Drift: "));
+    Serial.print(drift);
     Serial.print(F(" | Markers: "));
     Serial.print(_markerSystem.getMarkerCount());
     Serial.print(F("/"));
@@ -148,9 +159,23 @@ void StateMachine::handlePlaybackDelayState()
 
   if (elapsed >= MarkerSystem::PLAYBACK_DELAY_MS)
   {
+    // Verify we have exactly 3 markers
+    if (_markerSystem.getMarkerCount() != MarkerSystem::MAX_MARKERS) {
+      Serial.print(F("[Error] Need exactly "));
+      Serial.print(MarkerSystem::MAX_MARKERS);
+      Serial.print(F(" markers. Currently have "));
+      Serial.println(_markerSystem.getMarkerCount());
+      _currentState = STATE_DISABLED;
+      return;
+    }
+
     Serial.println(F("[Playback] BEGIN!"));
     digitalWrite(ENABLE_PIN, LOW); // Enable motor
     delay(100);
+
+    // Final sync to ensure accurate starting position
+    _motorControl.syncStepperToEncoder();
+
     _markerSystem.initializePlayback();
     _currentState = STATE_PLAYBACK;
   }

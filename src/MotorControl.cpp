@@ -357,3 +357,40 @@ long MotorControl::encoderToStepperPosition(long rotationCount, uint16_t rawAngl
 
   return stepperPos;
 }
+
+bool MotorControl::syncStepperToEncoder()
+{
+  // Verify encoder is calibrated
+  if (!_encoderCal.isCalibrated) {
+    Serial.println(F("[Error] Encoder not calibrated - run homing first"));
+    return false;
+  }
+
+  // Verify encoder connection
+  if (!_encoder.isConnected()) {
+    Serial.println(F("[Error] Encoder not connected"));
+    return false;
+  }
+
+  // Read current encoder position
+  long rotationCount = _encoder.getRotationCount();
+  uint16_t rawAngle = _encoder.getRawAngle();
+
+  // Convert to stepper position (already clamped to safe limits)
+  long stepperPos = encoderToStepperPosition(rotationCount, rawAngle);
+
+  // Update AccelStepper's internal position counter
+  _stepper.setCurrentPosition(stepperPos);
+
+  // Log synchronization for debugging
+  Serial.print(F("[MotorControl] Synced stepper to encoder: "));
+  Serial.print(F("Encoder("));
+  Serial.print(rotationCount);
+  Serial.print(F(":"));
+  Serial.print(rawAngle);
+  Serial.print(F(") -> Stepper("));
+  Serial.print(stepperPos);
+  Serial.println(F(" steps)"));
+
+  return true;
+}
