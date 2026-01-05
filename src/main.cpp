@@ -40,6 +40,12 @@
  * VCC    -> 3.3V
  * GND    -> GND
  *
+ * Continuous Rotation Servo (360°) -> ESP32 DevKit V1
+ * -------------------------------------------
+ * Signal -> GPIO 27 (PWM capable)
+ * VCC    -> 5V (external power recommended for higher current)
+ * GND    -> GND (common ground with ESP32)
+ *
  * Built-in LED
  * -------------------------------------------
  * LED    -> GPIO 2 (onboard LED on ESP32 DevKit V1)
@@ -91,6 +97,7 @@
 #include <Wire.h>
 #include <TMCStepper.h>
 #include <AccelStepper.h>
+#include <ESP32Servo.h>
 #include "EncoderReader.h"
 #include "HardwareConfig.h"
 #include "MotorControl.h"
@@ -114,6 +121,9 @@ EncoderReader encoder;
 MotorControl motorControl(TMC_Driver, stepper, encoder);
 MarkerSystem markerSystem(encoder, motorControl, stepper);
 StateMachine stateMachine(encoder, motorControl, markerSystem, stepper);
+
+// Continuous rotation servo
+Servo servo360;
 
 // ============================================================================
 // SETUP
@@ -263,6 +273,14 @@ void setup()
   markerSystem.begin();
   stateMachine.begin();
 
+  // Initialize continuous rotation servo
+  Serial.println(F("[SERVO] Initializing 360° servo"));
+  servo360.attach(SERVO_360_PIN);
+  servo360.write(SERVO_STOP); // Start in stopped position
+  Serial.print(F("[SERVO] Attached to GPIO"));
+  Serial.print(SERVO_360_PIN);
+  Serial.println(F(", controlled by joystick"));
+
   Serial.println(F("\n--- Ready ---"));
   Serial.println(F("Homing on startup..."));
 }
@@ -275,4 +293,49 @@ void loop()
 {
   // All logic handled by state machine
   stateMachine.update();
+
+  // Handle continuous rotation servo control with joystick
+  // Read joystick potentiometer (0-4095 on ESP32 12-bit ADC)
+  int vrxValue = analogRead(JOYSTICK_VRX);
+
+  // Map joystick position to servo speed
+  // Center (2048) = stop (90), Left (0) = full CCW (180), Right (4095) = full CW (0)
+  int servoSpeed;
+
+  if (abs(vrxValue - JOYSTICK_CENTER) < JOYSTICK_DEADZONE)
+  {
+    // Within deadzone - stop the servo
+    servoSpeed = SERVO_STOP;
+  }
+  else if (vrxValue < JOYSTICK_CENTER)
+  {
+    // Left side - counter-clockwise rotation
+    // Map from (0 to CENTER-DEADZONE) to (CCW_FULL to STOP)
+    servoSpeed = map(vrxValue, 0, JOYSTICK_CENTER - JOYSTICK_DEADZONE, SERVO_CCW_FULL, SERVO_STOP);
+  }
+  else
+  {
+    // Right side - clockwise rotation
+    // Map from (CENTER+DEADZONE to 4095) to (STOP to CW_FULL)
+    servoSpeed = map(vrxValue, JOYSTICK_CENTER + JOYSTICK_DEADZONE, 4095, SERVO_STOP, SERVO_CW_FULL);
+  }
+
+  servo360.write(servoSpeed);
+
+  // Debug output every 500ms
+  static unsigned long lastServoDebug = 0;
+  if (millis() - lastServoDebug > 500)
+  {
+    Serial.print(F("[SERVO] Joy: "));
+    Serial.print(vrxValue);
+    Serial.print(F(" → Speed: "));
+    Serial.print(servoSpeed);
+    if (servoSpeed == SERVO_STOP)
+      Serial.println(F(" (STOP)"));
+    else if (servoSpeed < SERVO_STOP)
+      Serial.println(F(" (CW)"));
+    else
+      Serial.println(F(" (CCW)"));
+    lastServoDebug = millis();
+  }
 }

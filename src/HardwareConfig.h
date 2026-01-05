@@ -35,6 +35,9 @@
 #define JOYSTICK_VRX 34  // GPIO34 - Joystick X-axis (ADC1_CH6, input only, 12-bit)
 #define JOYSTICK_SW 32   // GPIO32 - Joystick button (with internal pullup)
 
+// Continuous rotation servo pin
+#define SERVO_360_PIN 27 // GPIO27 - 360-degree continuous rotation servo (PWM capable)
+
 // ============================================================================
 // MOTOR & TMC2209 CONFIGURATION
 // ============================================================================
@@ -67,5 +70,11 @@
 #define JOYSTICK_HALF_THRESHOLD 600 // Threshold for half vs full speed (scaled 4x)
 #define JOYSTICK_MIN 0              // Minimum ADC value
 #define JOYSTICK_MAX 3200           // Maximum ADC value (scaled 4x, may need calibration)
+
+// Continuous rotation servo parameters
+#define SERVO_STOP 90       // Pulse value for stop (typically 90 degrees / 1500μs)
+#define SERVO_CW_FULL 0     // Pulse value for full speed clockwise
+#define SERVO_CCW_FULL 180  // Pulse value for full speed counter-clockwise
+#define SERVO_MOVE_DURATION 2000 // Time to move in each direction (ms)
 
 #endif // HARDWARE_CONFIG_H
