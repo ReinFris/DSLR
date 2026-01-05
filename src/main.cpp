@@ -1,68 +1,88 @@
 /*
- * TMC2209 Stepper Motor with AS5600 Encoder for Arduino Uno
+ * TMC2209 Stepper Motor with AS5600 Encoder for ESP32 DevKit V1
  *
  * ============================================================================
- * PIN DEFINITIONS - ARDUINO UNO
+ * PIN DEFINITIONS - ESP32 DevKit V1
  * ============================================================================
  *
- * TMC2209 Stepper Driver -> Arduino Uno
- * ----------------------------------------
- * STEP     -> Digital Pin 5
- * DIR      -> Digital Pin 4
- * EN       -> Digital Pin 6 (active LOW - pull LOW to enable driver)
- * DIAG     -> Digital Pin 3 (StallGuard detection, INT1, interrupt-capable)
- * PDN_UART -> Digital Pins 7 & 8 (see UART wiring below)
- * VCC_IO   -> 5V (Arduino logic level)
+ * TMC2209 Stepper Driver -> ESP32 DevKit V1
+ * ------------------------------------------
+ * STEP     -> GPIO 26 (PWM capable)
+ * DIR      -> GPIO 25 (PWM capable)
+ * EN       -> GPIO 33 (active LOW - pull LOW to enable driver)
+ * DIAG     -> GPIO 35 (StallGuard detection, input only, interrupt-capable)
+ * PDN_UART -> GPIO 16 & 17 (Hardware Serial2, see UART wiring below)
+ * VCC_IO   -> 3.3V (ESP32 logic level - IMPORTANT!)
  * GND      -> GND
- * VM       -> Motor power supply (4.75V - 29V, separate from Arduino)
+ * VM       -> Motor power supply (4.75V - 29V, separate from ESP32)
  * A1, A2, B1, B2 -> Stepper motor coils
  *
- * TMC2209 UART Communication (for sensorless homing)
- * ---------------------------------------------------
- * SW_RX    -> Digital Pin 7 (connect via 1kΩ resistor to PDN_UART)
- * SW_TX    -> Digital Pin 8 (connect directly to PDN_UART)
- * NOTE: A 1kΩ resistor MUST be placed between SW_RX (pin 7) and PDN_UART
- *       SW_TX (pin 8) connects directly to PDN_UART
+ * TMC2209 UART Communication (Hardware Serial2)
+ * ----------------------------------------------
+ * RX (GPIO16) -> Connect via 1kΩ resistor to PDN_UART
+ * TX (GPIO17) -> Connect directly to PDN_UART
+ * NOTE: A 1kΩ resistor MUST be placed between RX (GPIO16) and PDN_UART
+ *       TX (GPIO17) connects directly to PDN_UART
  *       Both pins connect to the same PDN_UART pin on TMC2209
+ *       ESP32 uses Hardware Serial2 (no SoftwareSerial needed)
  *
- * AS5600 Magnetic Encoder -> Arduino Uno
- * ----------------------------------------
- * VCC    -> 5V (or 3.3V if available on your Uno)
+ * AS5600 Magnetic Encoder -> ESP32 DevKit V1
+ * -------------------------------------------
+ * VCC    -> 3.3V (ESP32 logic level)
  * GND    -> GND
- * SDA    -> A4 (I2C SDA - FIXED on Arduino Uno)
- * SCL    -> A5 (I2C SCL - FIXED on Arduino Uno)
+ * SDA    -> GPIO 21 (I2C SDA - default on ESP32, configurable)
+ * SCL    -> GPIO 22 (I2C SCL - default on ESP32, configurable)
+ *
+ * Joystick -> ESP32 DevKit V1
+ * -------------------------------------------
+ * VRX    -> GPIO 34 (ADC1_CH6, input only, 12-bit ADC)
+ * SW     -> GPIO 32 (button with internal pullup)
+ * VCC    -> 3.3V
+ * GND    -> GND
  *
  * Built-in LED
- * ----------------------------------------
- * LED    -> Digital Pin 13 (onboard LED, used for status indication)
+ * -------------------------------------------
+ * LED    -> GPIO 2 (onboard LED on ESP32 DevKit V1)
  *
  * ============================================================================
  * IMPORTANT NOTES
  * ============================================================================
  *
- * 1. Arduino Uno I2C pins are FIXED:
- *    - A4 = SDA (cannot be changed)
- *    - A5 = SCL (cannot be changed)
+ * 1. VOLTAGE LEVEL - CRITICAL:
+ *    - ESP32 operates at 3.3V logic (NOT 5V like Arduino!)
+ *    - TMC2209 VCC_IO MUST be connected to 3.3V
+ *    - AS5600 supports both 3.3V and 5V (use 3.3V)
+ *    - All modules must be 3.3V compatible
  *
- * 2. AS5600 Hardware Setup:
+ * 2. ESP32 I2C pins are configurable:
+ *    - Default GPIO21 = SDA, GPIO22 = SCL
+ *    - Can be changed by calling Wire.begin(sda, scl)
+ *
+ * 3. AS5600 Hardware Setup:
  *    - Place a diametric magnet above the AS5600 sensor (2-3mm distance)
  *    - The magnet should be centered over the sensor
  *    - Magnet polarity: one pole facing the sensor
  *    - Recommended magnet: 6mm diameter x 2-3mm thickness
  *
- * 3. Sensorless Homing (StallGuard):
- *    - DIAG pin must be connected to pin 3 (interrupt-capable)
+ * 4. Sensorless Homing (StallGuard):
+ *    - DIAG pin connected to GPIO35 (interrupt-capable, input only)
+ *    - ESP32 supports interrupts on all GPIO pins
  *    - StallGuard detects motor stall when hitting physical limits
  *    - Startup sequence: Move until stall, reverse, stall, then back off
- *    - STALL_VALUE (10) controls sensitivity: higher = less sensitive
+ *    - STALL_VALUE controls sensitivity: higher = less sensitive
  *
- * 4. Power Supply:
- *    - TMC2209 VCC_IO: 5V from Arduino
+ * 5. Power Supply:
+ *    - TMC2209 VCC_IO: 3.3V from ESP32 (CRITICAL!)
  *    - TMC2209 VM: Separate motor power supply (typically 12V or 24V)
- *    - AS5600 VCC: 5V from Arduino (AS5600 supports 3.3V-5V)
- *    - Always connect grounds together (Arduino GND, motor PSU GND)
+ *    - AS5600 VCC: 3.3V from ESP32
+ *    - Always connect grounds together (ESP32 GND, motor PSU GND)
  *
- * 5. Serial Monitor:
+ * 6. ESP32 ADC:
+ *    - 12-bit resolution (0-4095) vs Arduino's 10-bit (0-1023)
+ *    - Joystick calibration values scaled 4x from Arduino version
+ *    - Using ADC1 to avoid conflicts with WiFi (if needed in future)
+ *
+ * 7. Serial Monitor:
  *    - Baud rate: 115200
  *    - Displays: Encoder angle, Degrees, Rotation count, Magnet status
  */
@@ -70,36 +90,35 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <TMCStepper.h>
-#include <SoftwareSerial.h>
 #include <AccelStepper.h>
 #include "EncoderReader.h"
 
 // ============================================================================
-// PIN ASSIGNMENTS FOR ARDUINO UNO
+// PIN ASSIGNMENTS FOR ESP32 DevKit V1
 // ============================================================================
 
 // Stepper motor control pins
-#define STEP_PIN 5   // Digital pin 5 - Step pulse for TMC2209
-#define DIR_PIN 4    // Digital pin 4 - Direction control for TMC2209
-#define ENABLE_PIN 6 // Digital pin 6 - Enable pin (LOW = enabled, HIGH = disabled)
-#define DIAG_PIN 3   // Digital pin 3 - StallGuard DIAG (INT1 - interrupt-capable)
+// TMC2209 Stepper Driver
+#define STEP_PIN 26      // GPIO26 - Step pulse for TMC2209 (PWM capable)
+#define DIR_PIN 25       // GPIO25 - Direction control for TMC2209 (PWM capable)
+#define ENABLE_PIN 33    // GPIO33 - Enable pin (LOW = enabled, HIGH = disabled)
+#define DIAG_PIN 35      // GPIO35 - StallGuard DIAG (input only, interrupt capable)
 
-// TMC2209 UART pins (SoftwareSerial)
-#define SW_RX 7 // Digital pin 7 - RX via 1kΩ resistor to PDN_UART
-#define SW_TX 8 // Digital pin 8 - TX directly to PDN_UART
+// TMC2209 UART pins (Hardware Serial2)
+#define TMC_UART_RX 16   // GPIO16 - Serial2 RX via 1kΩ resistor to PDN_UART
+#define TMC_UART_TX 17   // GPIO17 - Serial2 TX directly to PDN_UART
 
 // Status LED
-#define LED_PIN 13 // Digital pin 13 - Built-in LED on Arduino Uno
+#define LED_PIN 2        // GPIO2 - Built-in LED on ESP32 DevKit V1
 
 // I2C pins for AS5600 encoder
-// NOTE: These are FIXED on Arduino Uno and cannot be changed
-// Do NOT attempt to use other pins for I2C on Uno - it will not work
-#define I2C_SDA_PIN A4 // Analog pin A4 - I2C SDA (FIXED on Uno)
-#define I2C_SCL_PIN A5 // Analog pin A5 - I2C SCL (FIXED on Uno)
+// NOTE: ESP32 I2C pins are configurable, using default pins
+#define I2C_SDA_PIN 21   // GPIO21 - I2C SDA (default on ESP32)
+#define I2C_SCL_PIN 22   // GPIO22 - I2C SCL (default on ESP32)
 
 // Joystick pins
-#define JOYSTICK_VRX A0 // Analog pin A0 - Joystick X-axis (VRx)
-#define JOYSTICK_SW 2   // Digital pin 2 - Joystick button (INT0, interrupt-capable)
+#define JOYSTICK_VRX 34  // GPIO34 - Joystick X-axis (ADC1_CH6, input only, 12-bit)
+#define JOYSTICK_SW 32   // GPIO32 - Joystick button (with internal pullup)
 
 // ============================================================================
 // MOTOR & TMC2209 CONFIGURATION
@@ -127,22 +146,23 @@
 #define HOMING_BACKOFF_STEPS 500 // Steps to back off after hitting stall
 #define SAFETY_BUFFER_STEPS 50   // Safety buffer from hard limits (microsteps)
 
-// Joystick parameters
-#define JOYSTICK_CENTER 512         // Center position (ADC value 0-1023)
-#define JOYSTICK_DEADZONE 50        // Deadzone around center (prevents drift)
-#define JOYSTICK_HALF_THRESHOLD 150 // Threshold for half vs full speed
+// Joystick parameters (ESP32 12-bit ADC: 0-4095)
+#define JOYSTICK_CENTER 2048        // Center position (12-bit ADC midpoint)
+#define JOYSTICK_DEADZONE 200       // Deadzone around center (scaled 4x for 12-bit)
+#define JOYSTICK_HALF_THRESHOLD 600 // Threshold for half vs full speed (scaled 4x)
 #define JOYSTICK_MIN 0              // Minimum ADC value
-#define JOYSTICK_MAX 800            // Maximum ADC value
+#define JOYSTICK_MAX 3200           // Maximum ADC value (scaled 4x, may need calibration)
 
 // ============================================================================
 // GLOBAL OBJECTS
 // ============================================================================
 
-// Create SoftwareSerial for TMC2209 UART communication
-SoftwareSerial SoftSerial(SW_RX, SW_TX);
+// TMC2209 UART - Forward declare Serial stream (will use Serial2 on ESP32)
+// Serial2 will be initialized in setup() with begin(baud, config, rx, tx)
+Stream* TMCSerial_ptr = nullptr;
 
-// Create TMC2209 driver object
-TMC2209Stepper TMC_Driver(&SoftSerial, R_SENSE, DRIVER_ADDRESS);
+// Create TMC2209 driver object (pointer will be set to Serial2 in setup)
+TMC2209Stepper TMC_Driver(TMCSerial_ptr, R_SENSE, DRIVER_ADDRESS);
 
 // Create AccelStepper object using DRIVER mode (step/direction interface)
 // AccelStepper stepper(interface, stepPin, directionPin)
@@ -384,7 +404,7 @@ void homeX()
   delay(100);
 
   Serial.println(F("[Home] Attaching interrupt..."));
-  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallInterruptHandler, RISING);
+  attachInterrupt(DIAG_PIN, stallInterruptHandler, RISING);
   delay(10);
   stallDetected = false;
 
@@ -502,7 +522,7 @@ void homeX()
   Serial.print(safeMaxLimit);
   Serial.println(F(")"));
 
-  detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
+  detachInterrupt(DIAG_PIN);
   Serial.println(F("[Home] Interrupt detached"));
 
   // STEP 3: Move to center position using full AccelStepper capabilities
@@ -970,9 +990,10 @@ void setup()
     delay(200);
   }
 
-  // Initialize TMC2209 UART communication
+  // Initialize TMC2209 UART communication using ESP32 Serial2
   Serial.println(F("\n[TMC] Init UART"));
-  SoftSerial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, TMC_UART_RX, TMC_UART_TX);
+  TMCSerial_ptr = &Serial2;  // Point to Serial2 for TMC driver
   TMC_Driver.beginSerial(115200);
   delay(100);
 
@@ -1024,9 +1045,9 @@ void setup()
   Serial.print(F(" SpreadCycle="));
   Serial.println(TMC_Driver.en_spreadCycle() ? F("ON") : F("OFF"));
 
-  // Initialize I2C
-  Serial.println(F("[I2C] Init A4/A5"));
-  Wire.begin();
+  // Initialize I2C with ESP32 pins (GPIO21=SDA, GPIO22=SCL)
+  Serial.println(F("[I2C] Init GPIO21/GPIO22"));
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
 
   // Recover I2C bus
