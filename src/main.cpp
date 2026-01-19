@@ -96,6 +96,7 @@
 #include "MotorControl.h"
 #include "MarkerSystem.h"
 #include "StateMachine.h"
+#include "ESPNowComm.h"
 
 // ============================================================================
 // GLOBAL OBJECTS
@@ -114,6 +115,9 @@ EncoderReader encoder;
 MotorControl motorControl(TMC_Driver, stepper, encoder);
 MarkerSystem markerSystem(encoder, motorControl, stepper);
 StateMachine stateMachine(encoder, motorControl, markerSystem, stepper);
+
+// Create ESP-NOW receiver
+ESPNowReceiver espNowReceiver;
 
 // ============================================================================
 // SETUP
@@ -263,6 +267,20 @@ void setup()
   markerSystem.begin();
   stateMachine.begin();
 
+  // Initialize ESP-NOW receiver
+  Serial.println(F("\n[ESP-NOW] Initializing wireless control..."));
+  if (espNowReceiver.begin())
+  {
+    Serial.println(F("[ESP-NOW] Receiver initialized successfully"));
+    Serial.print(F("[ESP-NOW] This device MAC: "));
+    Serial.println(espNowReceiver.getMacAddress());
+  }
+  else
+  {
+    Serial.println(F("[ESP-NOW] Failed to initialize receiver!"));
+    Serial.println(F("[ESP-NOW] Will continue without wireless control"));
+  }
+
   Serial.println(F("\n--- Ready ---"));
   Serial.println(F("Homing on startup..."));
 }
@@ -273,6 +291,14 @@ void setup()
 
 void loop()
 {
+  // Process any received ESP-NOW commands
+  if (espNowReceiver.hasNewCommand())
+  {
+    const struct_command &cmd = espNowReceiver.getLastCommand();
+    stateMachine.processWirelessCommand(cmd);
+    espNowReceiver.clearNewCommand();
+  }
+
   // All logic handled by state machine
   stateMachine.update();
 }

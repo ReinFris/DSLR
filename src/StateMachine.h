@@ -18,6 +18,7 @@
 #include "MotorControl.h"
 #include "MarkerSystem.h"
 #include "HardwareConfig.h"
+#include "ESPNowComm.h"
 
 // ============================================================================
 // SYSTEM STATES
@@ -48,6 +49,9 @@ public:
 
   // Main update function (call in loop())
   void update();
+
+  // Process wireless command from ESP-NOW
+  void processWirelessCommand(const struct_command &cmd);
 
   // State accessor
   SystemState getCurrentState() const { return _currentState; }

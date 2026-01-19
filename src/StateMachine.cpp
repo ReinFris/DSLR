@@ -27,6 +27,110 @@ void StateMachine::begin()
 }
 
 // ============================================================================
+// WIRELESS COMMAND PROCESSING
+// ============================================================================
+
+void StateMachine::processWirelessCommand(const struct_command &cmd)
+{
+  // Handle different command types
+  switch (cmd.commandType)
+  {
+  case CMD_JOYSTICK_MOVE:
+    // Handle joystick movement (in appropriate states)
+    if (_currentState == STATE_READY || _currentState == STATE_DISABLED)
+    {
+      // Convert joystick value to motor movement
+      // Joystick range: -512 to +512
+      if (abs(cmd.joystickValue) > 50) // Deadzone
+      {
+        long targetSteps = _stepper.currentPosition() + (cmd.joystickValue / 10);
+        _stepper.moveTo(targetSteps);
+      }
+    }
+    break;
+
+  case CMD_BUTTON_PRESS:
+    // Simulate button press based on button event
+    if (cmd.buttonEvent == BTN_SHORT_PRESS)
+    {
+      // Process as short press (button event = 1)
+      if (_currentState == STATE_READY)
+      {
+        handleReadyState(1);
+      }
+      else if (_currentState == STATE_DISABLED)
+      {
+        handleDisabledState(1);
+      }
+    }
+    else if (cmd.buttonEvent == BTN_LONG_PRESS)
+    {
+      // Process as long press (button event = 2)
+      if (_currentState == STATE_READY)
+      {
+        handleReadyState(2);
+      }
+      else if (_currentState == STATE_DISABLED)
+      {
+        handleDisabledState(2);
+      }
+    }
+    break;
+
+  case CMD_SET_MARKER:
+    // Set marker at current position
+    if (_currentState == STATE_DISABLED)
+    {
+      _markerSystem.saveMarker();
+    }
+    break;
+
+  case CMD_START_PLAYBACK:
+    // Start playback sequence
+    if (_currentState == STATE_DISABLED)
+    {
+      Serial.println(F("\n=== STARTING PLAYBACK ==="));
+      _currentState = STATE_PLAYBACK_DELAY;
+    }
+    break;
+
+  case CMD_STOP:
+    // Emergency stop - return to ready state
+    Serial.println(F("\n=== EMERGENCY STOP ==="));
+    _stepper.stop();
+    digitalWrite(ENABLE_PIN, LOW);
+    _currentState = STATE_READY;
+    break;
+
+  case CMD_ENABLE_MOTOR:
+    // Enable motor
+    digitalWrite(ENABLE_PIN, LOW);
+    Serial.println(F("[MOTOR] Enabled"));
+    break;
+
+  case CMD_DISABLE_MOTOR:
+    // Disable motor for manual positioning
+    digitalWrite(ENABLE_PIN, HIGH);
+    _markerSystem.clearMarkers();
+    _currentState = STATE_DISABLED;
+    Serial.println(F("[MOTOR] Disabled for manual positioning"));
+    break;
+
+  case CMD_HOME:
+    // Trigger homing sequence
+    Serial.println(F("\n=== HOMING ==="));
+    _motorControl.homeX();
+    _currentState = STATE_READY;
+    break;
+
+  case CMD_NONE:
+  default:
+    // Ignore
+    break;
+  }
+}
+
+// ============================================================================
 // MAIN UPDATE
 // ============================================================================
 
