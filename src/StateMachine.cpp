@@ -37,14 +37,26 @@ void StateMachine::processWirelessCommand(const struct_command &cmd)
   {
   case CMD_JOYSTICK_MOVE:
     // Handle joystick movement (in appropriate states)
-    if (_currentState == STATE_READY || _currentState == STATE_DISABLED)
+    if (_currentState == STATE_READY)
     {
       // Convert joystick value to motor movement
       // Joystick range: -512 to +512
       if (abs(cmd.joystickValue) > 50) // Deadzone
       {
-        long targetSteps = _stepper.currentPosition() + (cmd.joystickValue / 10);
-        _stepper.moveTo(targetSteps);
+        // Scale joystick to speed (max 2000 steps/sec as per motor config)
+        float speedScale = (abs(cmd.joystickValue) / 512.0);
+        float targetSpeed = speedScale * 2000.0;
+        _stepper.setMaxSpeed(targetSpeed);
+
+        // Set large target in the joystick direction to keep moving
+        long direction = (cmd.joystickValue > 0) ? 1000000 : -1000000;
+        _stepper.moveTo(_stepper.currentPosition() + direction);
+      }
+      else
+      {
+        // Stop motor when joystick is centered
+        _stepper.stop();
+        _stepper.setMaxSpeed(2000.0); // Reset to default
       }
     }
     break;
