@@ -96,7 +96,13 @@
 #include "MotorControl.h"
 #include "MarkerSystem.h"
 #include "StateMachine.h"
+
+// Use WebInterface by default, ESP-NOW for receiver build
+#ifdef RECEIVER_BUILD
 #include "ESPNowComm.h"
+#else
+#include "WebInterface.h"
+#endif
 
 // ============================================================================
 // GLOBAL OBJECTS
@@ -116,8 +122,16 @@ MotorControl motorControl(TMC_Driver, stepper, encoder);
 MarkerSystem markerSystem(encoder, motorControl, stepper);
 StateMachine stateMachine(encoder, motorControl, markerSystem, stepper);
 
-// Create ESP-NOW receiver
+// Create control interface based on build type
+#ifdef RECEIVER_BUILD
+// ESP-NOW receiver for dual ESP32 setup
 ESPNowReceiver espNowReceiver;
+#else
+// Web Interface for laptop control (default)
+WebInterface webInterface(stateMachine);
+const char *AP_SSID = "DSLR_Motor_Control";
+const char *AP_PASSWORD = "motor123"; // Change this to your preferred password
+#endif
 
 // ============================================================================
 // SETUP
@@ -267,7 +281,9 @@ void setup()
   markerSystem.begin();
   stateMachine.begin();
 
-  // Initialize ESP-NOW receiver
+  // Initialize control interface
+#ifdef RECEIVER_BUILD
+  // ESP-NOW for dual ESP32 setup
   Serial.println(F("\n[ESP-NOW] Initializing wireless control..."));
   if (espNowReceiver.begin())
   {
@@ -278,8 +294,29 @@ void setup()
   else
   {
     Serial.println(F("[ESP-NOW] Failed to initialize receiver!"));
-    Serial.println(F("[ESP-NOW] Will continue without wireless control"));
   }
+#else
+  // Web Interface for laptop control
+  Serial.println(F("\n[WEB] Initializing web control interface..."));
+  if (webInterface.begin(AP_SSID, AP_PASSWORD, true)) // true = Access Point mode
+  {
+    Serial.println(F("[WEB] Web interface started successfully"));
+    Serial.println(F("\n==========================================="));
+    Serial.println(F("  CONNECT TO WEB INTERFACE"));
+    Serial.println(F("==========================================="));
+    Serial.print(F("  WiFi SSID: "));
+    Serial.println(AP_SSID);
+    Serial.print(F("  Password:  "));
+    Serial.println(AP_PASSWORD);
+    Serial.print(F("  Open browser: http://"));
+    Serial.println(webInterface.getIPAddress());
+    Serial.println(F("===========================================\n"));
+  }
+  else
+  {
+    Serial.println(F("[WEB] Failed to initialize web interface!"));
+  }
+#endif
 
   Serial.println(F("\n--- Ready ---"));
   Serial.println(F("Homing on startup..."));
@@ -291,13 +328,18 @@ void setup()
 
 void loop()
 {
-  // Process any received ESP-NOW commands
+#ifdef RECEIVER_BUILD
+  // Process ESP-NOW commands
   if (espNowReceiver.hasNewCommand())
   {
     const struct_command &cmd = espNowReceiver.getLastCommand();
     stateMachine.processWirelessCommand(cmd);
     espNowReceiver.clearNewCommand();
   }
+#else
+  // Handle web interface updates (HTTP server and WebSocket)
+  webInterface.update();
+#endif
 
   // All logic handled by state machine
   stateMachine.update();
