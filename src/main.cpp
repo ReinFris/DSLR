@@ -108,6 +108,9 @@
 // GLOBAL OBJECTS
 // ============================================================================
 
+// Global logging flag - starts enabled, can be toggled at runtime
+bool enableLogging = true;
+
 // TMC2209 driver object using ESP32's Serial2 (Hardware UART)
 TMC2209Stepper TMC_Driver(&Serial2, R_SENSE, DRIVER_ADDRESS);
 

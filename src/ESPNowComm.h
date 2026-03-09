@@ -32,7 +32,9 @@ enum CommandType
   CMD_STOP,               // Emergency stop
   CMD_ENABLE_MOTOR,       // Enable motor
   CMD_DISABLE_MOTOR,      // Disable motor for manual positioning
-  CMD_HOME                // Trigger homing sequence
+  CMD_HOME,               // Trigger homing sequence
+  CMD_ENABLE_LOGGING,     // Enable serial logging
+  CMD_DISABLE_LOGGING     // Disable serial logging
 };
 
 // Button event types

@@ -55,6 +55,8 @@ public:
 
   // State accessor
   SystemState getCurrentState() const { return _currentState; }
+  uint8_t getMarkerCount() const { return _markerSystem.getMarkerCount(); }
+  long getCurrentPosition() const { return _stepper.currentPosition(); }
 
 private:
   // Hardware references

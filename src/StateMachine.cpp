@@ -48,9 +48,26 @@ void StateMachine::processWirelessCommand(const struct_command &cmd)
         float targetSpeed = speedScale * 2000.0;
         _stepper.setMaxSpeed(targetSpeed);
 
-        // Set large target in the joystick direction to keep moving
-        long direction = (cmd.joystickValue > 0) ? 1000000 : -1000000;
-        _stepper.moveTo(_stepper.currentPosition() + direction);
+        // Calculate far target in joystick direction
+        long currentPos = _stepper.currentPosition();
+        long targetPos;
+        if (cmd.joystickValue > 0)
+        {
+          targetPos = currentPos + 100000; // Large positive target
+        }
+        else
+        {
+          targetPos = currentPos - 100000; // Large negative target
+        }
+
+        // Only update target if we're not already moving in that direction
+        // or if we've gotten close to the previous target
+        if ((_stepper.distanceToGo() > 0 && cmd.joystickValue < 0) ||
+            (_stepper.distanceToGo() < 0 && cmd.joystickValue > 0) ||
+            abs(_stepper.distanceToGo()) < 1000)
+        {
+          _stepper.moveTo(targetPos);
+        }
       }
       else
       {
@@ -108,7 +125,10 @@ void StateMachine::processWirelessCommand(const struct_command &cmd)
 
   case CMD_STOP:
     // Emergency stop - return to ready state
-    Serial.println(F("\n=== EMERGENCY STOP ==="));
+    if (enableLogging)
+    {
+      Serial.println(F("\n=== EMERGENCY STOP ==="));
+    }
     _stepper.stop();
     digitalWrite(ENABLE_PIN, LOW);
     _currentState = STATE_READY;
@@ -117,7 +137,10 @@ void StateMachine::processWirelessCommand(const struct_command &cmd)
   case CMD_ENABLE_MOTOR:
     // Enable motor
     digitalWrite(ENABLE_PIN, LOW);
-    Serial.println(F("[MOTOR] Enabled"));
+    if (enableLogging)
+    {
+      Serial.println(F("[MOTOR] Enabled"));
+    }
     break;
 
   case CMD_DISABLE_MOTOR:
@@ -125,14 +148,32 @@ void StateMachine::processWirelessCommand(const struct_command &cmd)
     digitalWrite(ENABLE_PIN, HIGH);
     _markerSystem.clearMarkers();
     _currentState = STATE_DISABLED;
-    Serial.println(F("[MOTOR] Disabled for manual positioning"));
+    if (enableLogging)
+    {
+      Serial.println(F("[MOTOR] Disabled for manual positioning"));
+    }
     break;
 
   case CMD_HOME:
     // Trigger homing sequence
-    Serial.println(F("\n=== HOMING ==="));
+    if (enableLogging)
+    {
+      Serial.println(F("\n=== HOMING ==="));
+    }
     _motorControl.homeX();
     _currentState = STATE_READY;
+    break;
+
+  case CMD_ENABLE_LOGGING:
+    // Enable serial logging
+    enableLogging = true;
+    Serial.println(F("[LOGGING] Enabled"));
+    break;
+
+  case CMD_DISABLE_LOGGING:
+    // Disable serial logging (may improve motion smoothness)
+    Serial.println(F("[LOGGING] Disabled"));
+    enableLogging = false;
     break;
 
   case CMD_NONE:
@@ -234,9 +275,9 @@ void StateMachine::handleDisabledState(uint8_t buttonEvent)
     _currentState = STATE_PLAYBACK_DELAY;
   }
 
-  // Display position periodically
+  // Display position periodically (only if logging enabled)
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 200)
+  if (enableLogging && millis() - lastPrint > 200)
   {
     long encoderRot = _encoder.getRotationCount();
     uint16_t encoderAngle = _encoder.getRawAngle();

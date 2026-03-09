@@ -5,6 +5,7 @@
 #include "WebInterface.h"
 #include "StateMachine.h"
 #include "ESPNowComm.h"
+#include "HardwareConfig.h"
 
 // Static instance pointer
 WebInterface *WebInterface::instance = nullptr;
@@ -25,8 +26,8 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
         }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #fff;
+            background: #7C98A0;
+            color: #4A3329;
             padding: 20px;
             min-height: 100vh;
         }
@@ -38,18 +39,22 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             text-align: center;
             margin-bottom: 30px;
             font-size: 2.5em;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            color: #4A3329;
+            font-weight: 300;
+            letter-spacing: 2px;
         }
         .status {
-            background: rgba(255,255,255,0.1);
-            border-radius: 15px;
+            background: #B2C7C4;
+            border-radius: 8px;
             padding: 20px;
             margin-bottom: 20px;
-            backdrop-filter: blur(10px);
+            border: 2px solid #8C9C7B;
         }
         .status h2 {
             margin-bottom: 10px;
             font-size: 1.2em;
+            color: #4A3329;
+            font-weight: 400;
         }
         .status-grid {
             display: grid;
@@ -58,18 +63,21 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             margin-top: 15px;
         }
         .status-item {
-            background: rgba(255,255,255,0.1);
+            background: #7C98A0;
             padding: 15px;
-            border-radius: 10px;
+            border-radius: 6px;
         }
         .status-label {
             font-size: 0.9em;
-            opacity: 0.8;
+            color: #B2C7C4;
             margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
         }
         .status-value {
             font-size: 1.5em;
-            font-weight: bold;
+            font-weight: 600;
+            color: #ffffff;
         }
         .controls {
             display: grid;
@@ -83,39 +91,26 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             }
         }
         .control-panel {
-            background: rgba(255,255,255,0.1);
-            border-radius: 15px;
+            background: #B2C7C4;
+            border-radius: 8px;
             padding: 25px;
-            backdrop-filter: blur(10px);
+            border: 2px solid #8C9C7B;
         }
         .control-panel h2 {
             margin-bottom: 20px;
             font-size: 1.3em;
+            color: #4A3329;
+            font-weight: 400;
         }
-        .joystick-container {
-            position: relative;
-            width: 250px;
-            height: 250px;
-            margin: 20px auto;
-            background: rgba(0,0,0,0.2);
-            border-radius: 50%;
-            border: 3px solid rgba(255,255,255,0.3);
+        .direction-btn {
+            background: #D4876B;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
         }
-        .joystick {
-            position: absolute;
-            width: 80px;
-            height: 80px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 50%;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            cursor: grab;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
-            border: 3px solid rgba(255,255,255,0.5);
-        }
-        .joystick:active {
-            cursor: grabbing;
+        .direction-btn:active {
+            background: #b36c53;
+            transform: scale(0.95);
         }
         .button-grid {
             display: grid;
@@ -123,61 +118,69 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             gap: 15px;
         }
         button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: #8C9C7B;
+            color: #ffffff;
             border: none;
             padding: 18px 25px;
-            border-radius: 12px;
+            border-radius: 6px;
             font-size: 1.1em;
             cursor: pointer;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
-            font-weight: 600;
+            transition: all 0.2s ease;
+            font-weight: 500;
         }
         button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+            background: #6f7d61;
+            transform: translateY(-1px);
         }
         button:active {
             transform: translateY(0);
         }
         button.emergency {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            background: #D4876B;
             grid-column: span 2;
         }
+        button.emergency:hover {
+            background: #b36c53;
+        }
         button.primary {
-            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            background: #7C98A0;
+        }
+        button.primary:hover {
+            background: #617780;
         }
         .marker-list {
-            background: rgba(0,0,0,0.2);
-            border-radius: 10px;
+            background: #7C98A0;
+            border-radius: 6px;
             padding: 15px;
             max-height: 200px;
             overflow-y: auto;
         }
         .marker-item {
-            background: rgba(255,255,255,0.1);
+            background: #8C9C7B;
             padding: 10px;
             margin-bottom: 8px;
-            border-radius: 8px;
+            border-radius: 4px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            color: #ffffff;
         }
         .connection-status {
             position: fixed;
             top: 20px;
             right: 20px;
             padding: 10px 20px;
-            border-radius: 20px;
+            border-radius: 6px;
             font-size: 0.9em;
-            font-weight: 600;
+            font-weight: 500;
         }
         .connection-status.connected {
-            background: #48bb78;
+            background: #8C9C7B;
+            color: #ffffff;
         }
         .connection-status.disconnected {
-            background: #f56565;
+            background: #D4876B;
+            color: #ffffff;
         }
     </style>
 </head>
@@ -185,7 +188,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     <div class="connection-status" id="connectionStatus">Connecting...</div>
 
     <div class="container">
-        <h1>🎬 DSLR Motor Control</h1>
+        <h1>DSLR MOTOR CONTROL</h1>
 
         <div class="status">
             <h2>System Status</h2>
@@ -212,24 +215,38 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
         <div class="controls">
             <div class="control-panel">
                 <h2>Movement Control</h2>
-                <div class="joystick-container" id="joystickContainer">
-                    <div class="joystick" id="joystick"></div>
+                <div style="display: flex; gap: 20px; justify-content: center; margin: 20px 0;">
+                    <button id="leftBtn" class="direction-btn" style="flex: 1; max-width: 200px; min-height: 120px; font-size: 48px;">
+                        ◄
+                    </button>
+                    <button id="rightBtn" class="direction-btn" style="flex: 1; max-width: 200px; min-height: 120px; font-size: 48px;">
+                        ►
+                    </button>
                 </div>
                 <div style="text-align: center; opacity: 0.8; margin-top: 10px;">
-                    Drag to move motor
+                    Hold button to move motor
                 </div>
             </div>
 
             <div class="control-panel">
                 <h2>Motor Controls</h2>
                 <div class="button-grid">
-                    <button onclick="sendCommand('home')">🏠 Home</button>
-                    <button onclick="sendCommand('enable')">✓ Enable</button>
-                    <button onclick="sendCommand('disable')">✗ Disable</button>
-                    <button onclick="sendCommand('marker')" class="primary">📍 Add Marker</button>
-                    <button onclick="sendCommand('playback')" class="primary">▶ Playback</button>
-                    <button onclick="sendCommand('clearMarkers')">🗑 Clear Markers</button>
-                    <button onclick="sendCommand('stop')" class="emergency">🛑 EMERGENCY STOP</button>
+                    <button onclick="sendCommand('home')">Home</button>
+                    <button onclick="sendCommand('enable')">Enable</button>
+                    <button onclick="sendCommand('disable')">Disable</button>
+                    <button onclick="sendCommand('marker')" class="primary">Add Marker</button>
+                    <button onclick="sendCommand('playback')" class="primary">Playback</button>
+                    <button onclick="sendCommand('clearMarkers')">Clear Markers</button>
+                    <button onclick="sendCommand('stop')" class="emergency">EMERGENCY STOP</button>
+                </div>
+                <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(74, 51, 41, 0.2);">
+                    <label style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;">
+                        <span style="font-size: 0.95em;">Enable Logging</span>
+                        <input type="checkbox" id="loggingToggle" onchange="toggleLogging(this.checked)" checked style="width: 20px; height: 20px; cursor: pointer;">
+                    </label>
+                    <div style="font-size: 0.85em; opacity: 0.7; margin-top: 8px;">
+                        Disable to improve motion smoothness
+                    </div>
                 </div>
             </div>
         </div>
@@ -295,85 +312,59 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             }
         }
 
-        // Joystick control
-        const joystick = document.getElementById('joystick');
-        const container = document.getElementById('joystickContainer');
-
-        let isDragging = false;
-        let startX, startY;
-
-        function handleStart(e) {
-            isDragging = true;
-            joystickActive = true;
-            const touch = e.touches ? e.touches[0] : e;
-            startX = touch.clientX;
-            startY = touch.clientY;
-
-            // Start sending joystick updates
-            joystickInterval = setInterval(sendJoystickPosition, 100);
+        // Toggle logging on/off
+        function toggleLogging(enabled) {
+            const cmd = enabled ? 'enableLogging' : 'disableLogging';
+            sendCommand(cmd);
         }
 
-        function handleMove(e) {
-            if(!isDragging) return;
-            e.preventDefault();
+        // Direction button control
+        const leftBtn = document.getElementById('leftBtn');
+        const rightBtn = document.getElementById('rightBtn');
+        let moveInterval = null;
+        let currentDirection = 0;
 
-            const touch = e.touches ? e.touches[0] : e;
-            const rect = container.getBoundingClientRect();
-            const centerX = rect.left + rect.width / 2;
-            const centerY = rect.top + rect.height / 2;
-
-            let deltaX = touch.clientX - centerX;
-            let deltaY = touch.clientY - centerY;
-
-            // Limit to circle radius
-            const maxRadius = (rect.width / 2) - 40;
-            const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-            if(distance > maxRadius) {
-                const angle = Math.atan2(deltaY, deltaX);
-                deltaX = maxRadius * Math.cos(angle);
-                deltaY = maxRadius * Math.sin(angle);
-            }
-
-            joystick.style.transform = `translate(calc(-50% + ${deltaX}px), calc(-50% + ${deltaY}px))`;
+        function startMove(direction) {
+            currentDirection = direction;
+            sendMove();
+            // Send continuous updates while button is held
+            moveInterval = setInterval(sendMove, 100);
         }
 
-        function handleEnd() {
-            isDragging = false;
-            joystickActive = false;
-            joystick.style.transform = 'translate(-50%, -50%)';
-            clearInterval(joystickInterval);
+        function stopMove() {
+            currentDirection = 0;
+            clearInterval(moveInterval);
+            moveInterval = null;
+            sendMove();
+        }
 
-            // Send zero position
+        function sendMove() {
             if(ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({cmd: 'joystick', value: 0}));
+                // Send full speed in direction: -512 for left, +512 for right
+                const value = currentDirection * 512;
+                ws.send(JSON.stringify({cmd: 'joystick', value: value}));
             }
         }
 
-        function sendJoystickPosition() {
-            if(!joystickActive) return;
+        // Mouse events for left button
+        leftBtn.addEventListener('mousedown', () => startMove(-1));
+        leftBtn.addEventListener('mouseup', stopMove);
+        leftBtn.addEventListener('mouseleave', stopMove);
 
-            const transform = joystick.style.transform;
-            const match = transform.match(/translate\(calc\(-50% \+ (-?\d+)px\)/);
-            if(match) {
-                const deltaX = parseInt(match[1]);
-                // Convert to -512 to 512 range
-                const value = Math.round((deltaX / 85) * 512);
+        // Touch events for left button
+        leftBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startMove(-1); });
+        leftBtn.addEventListener('touchend', stopMove);
+        leftBtn.addEventListener('touchcancel', stopMove);
 
-                if(ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({cmd: 'joystick', value: value}));
-                }
-            }
-        }
+        // Mouse events for right button
+        rightBtn.addEventListener('mousedown', () => startMove(1));
+        rightBtn.addEventListener('mouseup', stopMove);
+        rightBtn.addEventListener('mouseleave', stopMove);
 
-        // Mouse events
-        joystick.addEventListener('mousedown', handleStart);
-        document.addEventListener('mousemove', handleMove);
-        document.addEventListener('mouseup', handleEnd);
-
-        // Touch events
-        joystick.addEventListener('touchstart', handleStart);
-        document.addEventListener('touchmove', handleMove, {passive: false});
-        document.addEventListener('touchend', handleEnd);
+        // Touch events for right button
+        rightBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startMove(1); });
+        rightBtn.addEventListener('touchend', stopMove);
+        rightBtn.addEventListener('touchcancel', stopMove);
 
         // Initialize WebSocket
         connectWebSocket();
@@ -521,8 +512,11 @@ void WebInterface::handleWebSocketMessage(uint8_t clientNum, uint8_t *payload, s
 {
   // Parse JSON command
   String message = String((char *)payload);
-  Serial.print(F("[WS] Message: "));
-  Serial.println(message);
+  if (enableLogging)
+  {
+    Serial.print(F("[WS] Message: "));
+    Serial.println(message);
+  }
 
   // Simple JSON parsing (looking for "cmd" field)
   int cmdStart = message.indexOf("\"cmd\":\"") + 7;
@@ -574,9 +568,16 @@ void WebInterface::handleWebSocketMessage(uint8_t clientNum, uint8_t *payload, s
   }
   else if (cmd == "getStatus")
   {
-    // Send status update
-    // TODO: Implement status retrieval from state machine
+    sendStatusUpdate(clientNum);
     return;
+  }
+  else if (cmd == "enableLogging")
+  {
+    espCmd.commandType = CMD_ENABLE_LOGGING;
+  }
+  else if (cmd == "disableLogging")
+  {
+    espCmd.commandType = CMD_DISABLE_LOGGING;
   }
 
   // Send command to state machine
@@ -606,4 +607,37 @@ void WebInterface::broadcastStatus(const String &status)
 {
   String msg = status; // Create non-const copy
   _webSocket.broadcastTXT(msg);
+}
+
+void WebInterface::sendStatusUpdate(uint8_t clientNum)
+{
+  // Get current state
+  SystemState state = _stateMachine.getCurrentState();
+
+  // Convert state enum to string
+  String stateStr;
+  switch(state) {
+    case STATE_STARTUP: stateStr = "STARTUP"; break;
+    case STATE_READY: stateStr = "READY"; break;
+    case STATE_DISABLED: stateStr = "DISABLED"; break;
+    case STATE_PLAYBACK_DELAY: stateStr = "PLAYBACK_DELAY"; break;
+    case STATE_PLAYBACK: stateStr = "PLAYBACK"; break;
+    default: stateStr = "UNKNOWN"; break;
+  }
+
+  // Get other status info
+  long position = _stateMachine.getCurrentPosition();
+  uint8_t markerCount = _stateMachine.getMarkerCount();
+  bool motorEnabled = (digitalRead(ENABLE_PIN) == LOW);
+
+  // Build JSON response
+  String json = "{";
+  json += "\"state\":\"" + stateStr + "\",";
+  json += "\"position\":" + String(position) + ",";
+  json += "\"markerCount\":" + String(markerCount) + ",";
+  json += "\"motorEnabled\":" + String(motorEnabled ? "true" : "false");
+  json += "}";
+
+  // Send to client
+  _webSocket.sendTXT(clientNum, json);
 }

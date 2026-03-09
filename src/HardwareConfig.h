@@ -68,4 +68,12 @@
 #define JOYSTICK_MIN 0              // Minimum ADC value
 #define JOYSTICK_MAX 3200           // Maximum ADC value (scaled 4x, may need calibration)
 
+// ============================================================================
+// DEBUG CONFIGURATION
+// ============================================================================
+
+// Global logging flag - set to false to disable Serial output during motion
+// Can be toggled at runtime via web interface or ESP-NOW command
+extern bool enableLogging;
+
 #endif // HARDWARE_CONFIG_H

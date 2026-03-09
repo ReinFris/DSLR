@@ -48,6 +48,9 @@ public:
   // Send status update to all connected clients
   void broadcastStatus(const String &status);
 
+  // Send status update to specific client
+  void sendStatusUpdate(uint8_t clientNum);
+
 private:
   // Hardware reference
   StateMachine &_stateMachine;
